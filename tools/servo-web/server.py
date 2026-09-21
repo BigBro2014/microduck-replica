@@ -12,6 +12,9 @@ import argparse
 import asyncio
 import contextlib
 import json
+import logging
+import math
+from pathlib import Path
 import os
 import struct
 import threading
@@ -30,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 调试台版本。改了前端或后端就加一：index.html 里的 PAGE_VERSION 要跟这里一样，
 # 页面连上后会比对，不一样就提示"页面是旧的，Ctrl+F5"。改动记在 README 的「版本」一节。
-VERSION = "0.9.1"
+VERSION = "0.10.0"
 DEFAULT_IDS = "20-24,30-34,10-14"
 JOINT_NAMES = {
     20: "left_hip_yaw", 21: "left_hip_roll", 22: "left_hip_pitch", 23: "left_knee", 24: "left_ankle",
@@ -164,10 +167,11 @@ BAUD = 1_000_000
 IDS = []
 PRESENT = []
 CLIENTS = set()
+IMU_SERVICE = None  # 可选 J-Link 读取器；与舵机状态共用 /ws，不接受网页控制探针
 LOG = []           # [{"n": 序号, "t": "时:分:秒", "cat": 分类, "level": info/warn/error, "msg": 正文}]
 LOG_N = 0
 LOG_DIR = os.path.join(HERE, "logs")
-LOG_CATS = ["系统", "总线", "运动", "校准", "寄存器", "姿态", "方向"]   # 页面自己还有一类「页面」
+LOG_CATS = ["系统", "总线", "运动", "校准", "寄存器", "姿态", "方向", "IMU"]   # 页面自己还有一类「页面」
 LEVEL_TAG = {"info": "", "warn": "[警告]", "error": "[错误]", "debug": "[调试]"}
 _log_io = threading.Lock()
 STREAM_HZ = 10
@@ -255,7 +259,7 @@ def log_path():
 
 
 def log(msg, cat="系统", level="info", exc=False):
-    """cat：系统 / 总线 / 运动 / 校准 / 寄存器 / 姿态 / 方向。level：info / warn / error / debug。
+    """cat：系统 / 总线 / 运动 / 校准 / 寄存器 / 姿态 / 方向 / IMU。level：info / warn / error / debug。
     每行都追加到 logs/servo-web-日期.log（debug 只进文件，不上页面）；exc=True 把当前异常的 traceback 一起写进文件。
     出问题时这个文件就是现场，发过来或者让 Claude 直接读。"""
     global LOG_N
@@ -300,6 +304,11 @@ async def index(request):
     # 不让浏览器缓存页面：改了前端以后，缓存里的旧页面会用旧逻辑跑，现象像"改了没生效"
     return FileResponse(os.path.join(HERE, "index.html"),
                         headers={"Cache-Control": "no-store, max-age=0"})
+
+
+async def imu_attitude_file(request):
+    return FileResponse(os.path.join(HERE, "imu_attitude.js"), media_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
 
 
 async def model_file(request):
@@ -1067,12 +1076,12 @@ QUIET = {"goal", "goals", "goals_stream", "stream_end", "poses", "log", "release
 
 async def ws_endpoint(ws):
     await ws.accept()
-    CLIENTS.add(ws)
     await ws.send_text(json.dumps({"type": "hello", "ids": IDS, "present": PRESENT, "names": JOINT_NAMES,
                                    "fake": is_fake(), "logs": LOG[-150:], "cats": LOG_CATS, "dirs": load_dirs(),
                                    "port": PORT, "ports": list_ports(),
                                    "regs": [[a, *feetech.REGISTERS[a]] for a in sorted(feetech.REGISTERS)],
-                                   "version": VERSION}))
+                                   "version": VERSION, "imu_enabled": IMU_SERVICE is not None}))
+    CLIENTS.add(ws)  # hello 必须先于后台广播，前端先收到功能配置
     try:
         while True:
             cmd = json.loads(await ws.receive_text())
@@ -1093,15 +1102,89 @@ async def ws_endpoint(ws):
         CLIENTS.discard(ws)
 
 
+class ImuLogHandler(logging.Handler):
+    """J-Link SDK/桥接器也写现有的分类日志，保留一条排查时间线。"""
+
+    def emit(self, record):
+        level = ("error" if record.levelno >= logging.ERROR else
+                 "warn" if record.levelno >= logging.WARNING else
+                 "info" if record.levelno >= logging.INFO else "debug")
+        log(self.format(record), "IMU", level)
+
+
+def imu_error_frame(message):
+    return {"type": "imu", "status": "error", "mode": "live", "live": False,
+            "connected": False, "quaternion_xyzw": None, "message": message,
+            "timestamp_ms": int(time.time() * 1000)}
+
+
+async def imu_stream(service, startup_error=None):
+    """独立读状态/广播任务：串口超时不会拖慢 IMU，异常也不影响舵机流。"""
+    previous = None
+    error_last, error_time = "", 0.0
+    while True:
+        try:
+            frame = imu_error_frame(startup_error) if startup_error else service.get_status()
+            state = (frame.get("mode"), frame.get("status"), frame.get("connected"))
+            if state != previous:
+                level = "error" if frame.get("status") == "error" else (
+                    "info" if frame.get("live") else "warn")
+                log(f"状态 {frame.get('mode')}/{frame.get('status')}：{frame.get('message', '')}", "IMU", level)
+                previous = state
+            if CLIENTS:
+                await broadcast(json.dumps(frame))
+        except Exception as exc:
+            message = f"读取 IMU 状态失败：{type(exc).__name__}: {exc}"
+            now = time.monotonic()
+            if message != error_last or now - error_time >= 5:
+                log(message, "IMU", "error", exc=True)
+                error_last, error_time = message, now
+            if CLIENTS:
+                await broadcast(json.dumps(imu_error_frame(message)))
+        await asyncio.sleep(0.05)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
-    task = asyncio.create_task(stream())
-    yield
-    task.cancel()
+    tasks = [asyncio.create_task(stream())]
+    service = IMU_SERVICE
+    handler = None
+    logger = logging.getLogger("imu_bridge")
+    old_level, old_propagate = logger.level, logger.propagate
+    try:
+        if service is not None:
+            handler = ImuLogHandler()
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+            startup_error = None
+            try:
+                service.start()
+                log("姿态读取已启动（演示数据）" if service.demo else "J-Link 姿态读取已启动", "IMU")
+            except Exception as exc:
+                startup_error = f"启动 IMU 失败：{type(exc).__name__}: {exc}"
+                log(startup_error, "IMU", "error", exc=True)
+            tasks.append(asyncio.create_task(imu_stream(service, startup_error)))
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if service is not None:
+            try:
+                await asyncio.to_thread(service.stop)
+                log("姿态读取已停止，探针连接已释放", "IMU")
+            except Exception as exc:
+                log(f"停止 IMU 失败：{type(exc).__name__}: {exc}", "IMU", "error", exc=True)
+            finally:
+                logger.removeHandler(handler)
+                logger.setLevel(old_level)
+                logger.propagate = old_propagate
 
 
 app = Starlette(routes=[
     Route("/", index),
+    Route("/imu_attitude.js", imu_attitude_file),
     Route("/api/info", info),
     Route("/api/poses", poses),
     Route("/api/logfile", logfile),
@@ -1110,8 +1193,7 @@ app = Starlette(routes=[
 ], lifespan=lifespan)
 
 
-def main():
-    global BUS, IDS, PRESENT, BAUD
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="串口，如 COM5 / /dev/ttyUSB0 / /dev/ttyS2")
     ap.add_argument("--baud", type=int, default=1_000_000)
@@ -1119,7 +1201,63 @@ def main():
     ap.add_argument("--fake", action="store_true", help="不接舵机，界面演示")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--http-port", type=int, default=8080)
-    a = ap.parse_args()
+    imu = ap.add_mutually_exclusive_group()
+    imu.add_argument("--imu-jlink", type=Path, metavar="CONFIG.json",
+                     help="用本机配置文件启用 J-Link IMU 读数，数据仍走当前 /ws")
+    imu.add_argument("--imu-demo", action="store_true", help="合成 IMU 数据，不连接 J-Link")
+    return ap.parse_args(argv)
+
+
+def create_imu_service(args):
+    # 不启用时不导入桥接器，也不需要 J-Link SDK。
+    if not args.imu_jlink and not args.imu_demo:
+        return None
+    from imu_bridge import BridgeService, DEFAULT_FIRMWARE, validate_probe_settings
+    if args.imu_demo:
+        return BridgeService(demo=True)
+    path = args.imu_jlink.resolve()
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"IMU 配置读取失败 {path}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError("IMU 配置必须是 JSON 对象")
+    unknown = set(config) - {"dll", "probe_serial", "firmware", "hz", "resume"}
+    if unknown:
+        raise ValueError("未知 IMU 配置项：" + ", ".join(sorted(unknown)))
+    if not isinstance(config.get("dll"), str) or not config["dll"].strip():
+        raise ValueError("IMU 配置必须填写本机 JLink_x64.dll 路径 dll")
+    serial = config.get("probe_serial")
+    if isinstance(serial, bool) or not isinstance(serial, int) or serial <= 0:
+        raise ValueError("IMU 配置必须填写自己的正整数 probe_serial，不自动选择探针")
+    resume = config.get("resume", False)
+    if not isinstance(resume, bool):
+        raise ValueError("IMU 配置 resume 必须是 true 或 false")
+    hz = config.get("hz", 20)
+    if isinstance(hz, bool) or not isinstance(hz, (int, float)) or not math.isfinite(hz) or not 1 <= hz <= 20:
+        raise ValueError("IMU 配置 hz 必须是 1 到 20 之间的有限数值")
+
+    def config_path(value):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("IMU 文件路径必须是非空字符串")
+        candidate = Path(value).expanduser()
+        return (candidate if candidate.is_absolute() else path.parent / candidate).resolve()
+
+    dll = config_path(config["dll"])
+    dll, serial = validate_probe_settings(dll, serial)
+    firmware = config_path(config["firmware"]) if "firmware" in config else DEFAULT_FIRMWARE
+    if not firmware.is_file():
+        raise ValueError(f"IMU 固件文件不存在：{firmware}")
+    return BridgeService(dll_path=dll, serial=serial, firmware=firmware, hz=float(hz), resume=resume)
+
+
+def main(argv=None):
+    global BUS, IDS, PRESENT, BAUD, IMU_SERVICE
+    a = parse_args(argv)
+    try:
+        IMU_SERVICE = create_imu_service(a)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise SystemExit(f"IMU 配置错误：{exc}") from exc
     IDS = parse_ids(a.ids)
     BAUD = a.baud
     log(f"舵机调试台 v{VERSION} 启动，日志写在 {log_path()}", "系统")

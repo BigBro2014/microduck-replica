@@ -54,6 +54,11 @@
   .area-EEPROM { color:var(--warn); } .area-SRAM { color:var(--acc); } .area-反馈 { color:var(--muted); }
   .bad { color:var(--bad); } .muted { color:var(--muted); }
   #dumpWrap { max-height:420px; overflow:auto; }
+  #imuViewStatus { position:absolute;left:10px;top:64px;max-width:80%;background:rgba(22,29,26,.9);padding:5px 8px;border-radius:6px;font-size:12px;color:var(--warn);pointer-events:none; }
+  #imuPanel .muted { font-size:12px; }
+  #imuAngles { font-size:16px; }
+  #imuMessage { overflow-wrap:anywhere; }
+  #imuPanel p { margin:6px 0; }
 </style>
 </head>
 <body>
@@ -81,6 +86,7 @@
   <div id="viewWrap">
     <canvas id="view"></canvas>
     <div id="viewHud">模型加载中…</div>
+    <div id="imuViewStatus" hidden aria-live="polite"></div>
     <div id="hint"></div>
     <div id="viewBtns">
       <button onclick="resetCam()">复位视角</button>
@@ -91,6 +97,24 @@
   </div>
 
   <div class="col">
+    <section id="imuPanel" hidden>
+      <h2>躯干姿态 · IMU <span id="imuMode" class="badge"></span><span id="imuStatus" class="badge" aria-live="polite">等待数据</span></h2>
+      <div id="imuAngles">横滚 —° · 俯仰 —° · 偏航 —°</div>
+      <div class="row muted">采样 <b id="imuSamples">—</b> · 读取 <b id="imuHz">—</b> Hz · 参考电压 <b id="imuVoltage">—</b> V</div>
+      <div class="row muted">加速度 g <span id="imuAccel">—</span> · 角速度 °/s <span id="imuGyro">—</span></div>
+      <div class="row muted">错误：IMU <b id="imuErrors">—</b> · SPI <b id="imuSpiErrors">—</b> · FIFO <b id="imuFifoErrors">—</b></div>
+      <p class="muted" id="imuMessage">等待姿态数据；关节仍使用上方选择的舵机数据。</p>
+      <div class="row">
+        <button id="imuZero" disabled>当前姿态显示归零</button><button id="imuRaw" disabled>原始姿态</button>
+        <label>安装方向 <select id="imuMount">
+          <option value="y90">默认：绕 Y +90°</option><option value="identity">X 向前 / Y 向左 / Z 向上</option>
+          <option value="z90">绕 Z +90°</option><option value="z180">绕 Z 180°</option><option value="z-90">绕 Z −90°</option>
+          <option value="x90">绕 X +90°</option><option value="x-90">绕 X −90°</option><option value="y-90">绕 Y −90°</option>
+        </select></label>
+      </div>
+      <p class="muted" id="imuReference">首次有效数据自动设为显示零位；这些操作只影响本页，不改写板子或舵机。</p>
+      <p class="muted">躯干按 IMU 四元数转，关节按舵机数据转。六轴偏航会漂移；没有位移、脚底接触测量。重心与脚底区域是模型估计，不能据此判断实物平衡。</p>
+    </section>
     <section><h2>左腿 20–24 <span class="muted" style="font-weight:400">±：关节方向，存在 directions.json，影响 3D、站姿、序列、灵动，不动舵机</span> <button onclick="copyRobotdDirs()" style="font-size:12px;padding:3px 8px">复制 robotd 方向表</button></h2><div id="g20"></div></section>
     <section><h2>颈 / 头 / 嘴 30–34</h2><div id="g30"></div></section>
     <section><h2>右腿 10–14</h2><div id="g10"></div></section>
@@ -168,26 +192,32 @@
 
 <script>
 // 跟 server.py 的 VERSION 一起改。连上后比对，不一致说明浏览器拿的是旧页面
-const PAGE_VERSION = "0.9.1";
+const PAGE_VERSION = "0.10.0";
 const $ = id => document.getElementById(id);
 const v = id => Number($(id).value);
 let ws, names = {}, present = [], ids = [], lastDump = null, sendTimer = {}, lastSent = {};
 const rawPos = {}, goalPos = {};
 let dirs = {};   // 每颗 +1 / -1，来自服务端 directions.json，所有页面共用
+let isServoDemo = false;
+// The module can load after hello/the first frame: retain the latest state for it.
+const imuFeed = { enabled:false, connected:false, packet:null, revision:0 };
+function announceImu() { imuFeed.revision++; window.dispatchEvent(new Event('imu-feed')); }
 
 function connect() {
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   ws.onopen = () => { $('dot').classList.add('on'); $('conn').textContent = '已连接'; };
-  ws.onclose = () => { $('dot').classList.remove('on'); $('conn').textContent = '断开，3 秒后重连'; pushLog({ t: new Date().toTimeString().slice(0, 8), cat: '页面', level: 'warn', msg: '跟服务的连接断了，3 秒后重连' }); setTimeout(connect, 3000); };
+  ws.onclose = () => { imuFeed.connected=false; announceImu(); $('dot').classList.remove('on'); $('conn').textContent = '断开，3 秒后重连'; pushLog({ t: new Date().toTimeString().slice(0, 8), cat: '页面', level: 'warn', msg: '跟服务的连接断了，3 秒后重连' }); setTimeout(connect, 3000); };
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
     if (m.type === 'hello') {
+      imuFeed.enabled=m.imu_enabled === true; imuFeed.connected=true; imuFeed.packet=null; announceImu();
       const sv = m.version || '旧版', same = sv === PAGE_VERSION;
       $('ver').textContent = same ? `v${PAGE_VERSION}` : `页面 v${PAGE_VERSION} · 服务 v${sv} 不一致`;
       $('ver').style.color = same ? '' : 'var(--bad)';
       $('ver').title = same ? '页面和服务版本一致' : '浏览器里是旧页面或服务没重启：先重启 server.py，再 Ctrl+F5';
       if (!same) hint(`页面 v${PAGE_VERSION} 跟服务 v${sv} 不一致：重启 server.py 后按 Ctrl+F5`);
       dirs = {}; for (const [k, v] of Object.entries(m.dirs || {})) dirs[k] = v; names = m.names; ids = m.ids; present = m.present;  REGS = (m.regs || []).filter(r => r[3] === 'EEPROM' || r[3] === 'SRAM'); showPorts(m); fillLogCats(m.cats || []); build(); fillRegSelect(); (m.logs || []).forEach(pushLog); send({ op: 'poses' }); }
+    else if (m.type === 'imu') { if (imuFeed.enabled) { imuFeed.packet=m; announceImu(); } }
     else if (m.type === 'ports') showPorts(m);
     else if (m.type === 'reconnect') {
       showPorts(m);
@@ -210,6 +240,7 @@ function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
 // 串口：没连上时顶栏出现下拉 + 「连接」；连上了只显示口号。拔插 USB 后口号会变，点一下就能重连
 function showPorts(m) {
   if (m.fake === undefined) return;
+  isServoDemo = m.fake === true;
   const box = $('portBox'), sel = $('portSel');
   $('busInfo').textContent = m.fake ? '没连串口（假总线，舵机不会动）' : `串口 ${m.port}`;
   $('busInfo').style.color = m.fake ? 'var(--warn)' : '';
@@ -618,6 +649,48 @@ connect();
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { ImuAttitude, eulerDegrees } from './imu_attitude.js';
+
+let imuAttitude = new ImuAttitude(), imuRevision = -1;
+const imuNumber = (n, digits=0) => typeof n === 'number' && Number.isFinite(n) ? n.toFixed(digits) : '—';
+const imuVector = v => Array.isArray(v) && v.length === 3 ? v.map(n => imuNumber(n, 3)).join(' / ') : '—';
+function renderImu() {
+  $('imuPanel').hidden = !imuFeed.enabled; $('imuViewStatus').hidden = !imuFeed.enabled;
+  if (!imuFeed.enabled) return;
+  $('imuMount').value = imuAttitude.mountName;
+  const p = imuAttitude.latest || {}, valid = imuAttitude.valid, demo = p.mode === 'demo';
+  $('imuMode').textContent = demo ? '演示 · 非硬件' : 'J-Link · SWD';
+  $('imuMode').style.color = demo ? 'var(--warn)' : 'var(--muted)';
+  const status = valid ? (demo ? '演示跟随' : '实时跟随') :
+    ({stale:'数据已停滞', error:'数据无效', disconnected:'连接中断'}[imuAttitude.status] || '等待有效数据');
+  $('imuStatus').textContent = status; $('imuStatus').style.color = valid ? 'var(--acc)' : 'var(--warn)';
+  $('imuZero').disabled = !valid; $('imuRaw').disabled = !valid;
+  $('imuSamples').textContent = imuNumber(p.sample_count); $('imuHz').textContent = valid ? imuNumber(p.hz, 1) : '—';
+  $('imuVoltage').textContent = demo ? '—' : imuNumber(typeof p.voltage_mv === 'number' ? p.voltage_mv/1000 : null, 3);
+  $('imuErrors').textContent = imuNumber(p.error ?? p.errors?.imu); $('imuSpiErrors').textContent = imuNumber(p.errors?.spi); $('imuFifoErrors').textContent = imuNumber(p.errors?.fifo);
+  $('imuAccel').textContent = valid ? imuVector(p.accel_g) : '—'; $('imuGyro').textContent = valid ? imuVector(p.gyro_dps) : '—';
+  const angles = valid ? eulerDegrees(imuAttitude.target).map(n => n.toFixed(1)) : ['—', '—', '—'];
+  $('imuAngles').textContent = `横滚 ${angles[0]}° · 俯仰 ${angles[1]}° · 偏航 ${angles[2]}°`;
+  $('imuReference').textContent = (imuAttitude.raw ? '原始姿态（含安装方向转换）' : '相对姿态（首次有效数据自动归零）') + '；显示归零、安装方向仅影响本页，不改写板子或舵机。';
+  $('imuMessage').textContent = valid ? (demo ? '软件合成姿态，不是板子读数。' : p.message || '已收到有效姿态。') :
+    `${status}，躯干保留最后一帧；${imuFeed.connected ? p.message || '等待新的有效采样。' : '与服务的 WebSocket 已断开，正在重连。'}`;
+  $('imuViewStatus').textContent = `躯干 IMU：${status}${demo ? '（非硬件）' : ''}${valid ? '' : ' · 保留最后姿态'} · 关节：${showWhat === 'goal' ? '滑块目标' : '舵机位置'}${isServoDemo ? '（假总线）' : ''}`;
+  $('imuViewStatus').style.color = valid && !demo ? 'var(--muted)' : 'var(--warn)';
+}
+function acceptImuFeed() {
+  if (imuRevision === imuFeed.revision) return;
+  imuRevision = imuFeed.revision;
+  if (!imuFeed.enabled) imuAttitude = new ImuAttitude();
+  else if (!imuFeed.connected || !imuFeed.packet) imuAttitude.disconnect();
+  else imuAttitude.receive(imuFeed.packet, performance.now());
+  renderImu();
+}
+window.addEventListener('imu-feed', acceptImuFeed); acceptImuFeed();
+setInterval(() => { imuAttitude.expire(performance.now()); renderImu(); }, 250);
+$('imuMount').value = imuAttitude.mountName;
+$('imuMount').addEventListener('change', () => { imuAttitude.setMount($('imuMount').value); renderImu(); addLog(`姿态显示安装方向：${$('imuMount').selectedOptions[0].textContent}（仅本页）`, 'IMU'); });
+$('imuZero').addEventListener('click', () => { if (imuAttitude.zero()) { renderImu(); addLog('IMU 当前姿态设为显示零位（仅本页，不写硬件）', 'IMU'); } });
+$('imuRaw').addEventListener('click', () => { if (imuAttitude.showRaw()) { renderImu(); addLog('IMU 切换到原始姿态显示（仅本页）', 'IMU'); } });
 
 const canvas = document.getElementById('view');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -635,12 +708,15 @@ scene.add(new THREE.HemisphereLight(0xdfe8e2, 0x1a221e, 1.1));
 const key = new THREE.DirectionalLight(0xffffff, 1.4); key.position.set(0.5, -0.6, 0.9); scene.add(key);
 const fill = new THREE.DirectionalLight(0x8fb8ff, 0.5); fill.position.set(-0.6, 0.4, 0.3); scene.add(fill);
 const grid = new THREE.GridHelper(0.6, 12, 0x2c3a33, 0x1e2925); grid.rotation.x = Math.PI / 2; scene.add(grid);
+// A parent at the trunk origin rotates the whole kinematic tree. Joint pivots stay independent.
+const trunkAttitude = new THREE.Group(), robotContent = new THREE.Group();
+trunkAttitude.name = 'imu-trunk-attitude'; trunkAttitude.add(robotContent); scene.add(trunkAttitude);
 
 const joints = {};   // servo id -> {pivot, axis, dir}
 const hud = document.getElementById('viewHud');
 const massInfo = [], soleInfo = [];   // 重心：每个 body 的质量/质心；脚底：sole 网格包围盒角点（踝体系）
 let comMark = null, comLine = null, comRing = null, soleLoops = [], supportBox = null, comText = document.createElement('div');
-comText.style.cssText = 'position:absolute;right:10px;bottom:10px;font-size:12px;color:#8fa098;background:rgba(22,29,26,.85);padding:6px 10px;border-radius:6px;pointer-events:none';
+comText.style.cssText = 'position:absolute;left:10px;right:10px;bottom:10px;font-size:12px;color:#8fa098;background:rgba(22,29,26,.85);padding:6px 10px;border-radius:6px;pointer-events:none';
 document.getElementById('viewWrap').appendChild(comText);
 function buildComMarkers() {
   if (!massInfo.length) return;
@@ -656,7 +732,8 @@ function updateCom() {
   let total = 0; const c = new THREE.Vector3();
   massInfo.forEach(m => { _v.copy(m.com); m.inner.localToWorld(_v); c.addScaledVector(_v, m.mass); total += m.mass; });
   c.divideScalar(total);
-  // 两只脚底的角点投到世界系，地面取最低点；支撑区取两脚包围盒（近似凸包）
+  // Include the IMU parent transform: all masses and sole corners are in world coordinates.
+  // This is a model AABB projection, not measured foot contact or a physical stability test.
   let gz = Infinity, xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
   soleInfo.forEach((s, i) => {
     const pts = s.corners.map(p => { const w = p.clone(); s.inner.localToWorld(w); return w; });
@@ -674,7 +751,7 @@ function updateCom() {
   comMark.position.copy(c); comRing.position.set(c.x, c.y, gz + 0.001);
   comLine.geometry.setFromPoints([c, new THREE.Vector3(c.x, c.y, gz)]); comLine.computeLineDistances();
   const toe = (xmax - c.x) * 1000, heel = (c.x - xmin) * 1000, left = (ymax - c.y) * 1000, right = (c.y - ymin) * 1000;
-  comText.textContent = `重心投影：${inside ? '在支撑区内' : '出了支撑区'} · 距脚尖 ${toe.toFixed(0)} · 距脚跟 ${heel.toFixed(0)} · 左 ${left.toFixed(0)} · 右 ${right.toFixed(0)} mm（按模型质量，${(total * 1000).toFixed(0)} g）`;
+  comText.textContent = `模型重心投影${inside ? '在' : '不在'}脚底包围矩形内 · 世界 +X/−X/+Y/−Y 余量 ${toe.toFixed(0)}/${heel.toFixed(0)}/${left.toFixed(0)}/${right.toFixed(0)} mm（模型 ${(total * 1000).toFixed(0)} g；非实物平衡判定${imuFeed.enabled && !imuAttitude.valid ? '；IMU 保留最后帧' : ''}）`;
   comText.style.color = inside ? '#8fa098' : '#f05a5a';
 }
 
@@ -697,6 +774,11 @@ async function loadModel() {
     geoms[name] = g;
   }
   const objs = [];
+  const rootBody = mj.bodies.find(b => b.parent < 0);
+  if (rootBody) {
+    trunkAttitude.position.set(...rootBody.pos);
+    robotContent.position.copy(trunkAttitude.position).negate();
+  }
   const mjq = q => new THREE.Quaternion(q[1], q[2], q[3], q[0]);  // MuJoCo w x y z
   mj.bodies.forEach((b, i) => {
     const node = new THREE.Group(); node.name = b.name;
@@ -713,7 +795,7 @@ async function loadModel() {
       mesh.position.set(...g.pos); mesh.quaternion.copy(mjq(g.quat)); inner.add(mesh);
     }
     objs.push({ node, inner });
-    if (b.parent < 0) scene.add(node); else objs[b.parent].inner.add(node);
+    if (b.parent < 0) robotContent.add(node); else objs[b.parent].inner.add(node);
     if (b.mass) massInfo.push({ inner, mass: b.mass, com: new THREE.Vector3(...b.com) });
     if (b.sole) {
       const mb = mj.meshes[b.sole.mesh], lo = mb.bbox_min, hi = mb.bbox_max, R = mjq(b.sole.quat), P = new THREE.Vector3(...b.sole.pos);
@@ -740,7 +822,12 @@ function resize() {
   const w = canvas.clientWidth, h = canvas.clientHeight;
   if (canvas.width !== w * renderer.getPixelRatio() || canvas.height !== h * renderer.getPixelRatio()) { renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); }
 }
-function frame() { resize(); pose(); scene.updateMatrixWorld(true); updateCom(); controls.update(); renderer.render(scene, camera); requestAnimationFrame(frame); }
+function frame() {
+  resize(); pose();
+  if (!imuFeed.enabled) trunkAttitude.quaternion.identity();
+  else if (imuAttitude.valid) trunkAttitude.quaternion.fromArray(imuAttitude.target);
+  scene.updateMatrixWorld(true); updateCom(); controls.update(); renderer.render(scene, camera); requestAnimationFrame(frame);
+}
 frame();
 </script>
 </body>

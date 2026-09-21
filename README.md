@@ -57,6 +57,9 @@ MJCF 里包含了完整的运动学树：每个零件挂在谁身上、相对位
 
 ## 最近更新
 
+**IMU 姿态接入调试台**：[`tools/servo-web/`](tools/servo-web/) 可选接入 J-Link，在同一个 3D 鸭子上显示舵机关节角与 IMU 躯干姿态。配套裸板固件在 [`hardware/imu_to_dxl/firmware/`](hardware/imu_to_dxl/firmware/)；飞特 15 字节总线协议尚未实现。
+
+
 <table>
 <tr>
 <td width="50%" valign="top">

@@ -15,7 +15,7 @@
   用 0x0B 位置校准指令（HD-1910 不认扭矩开关写 128，见下）。逐颗 解锁 → 读位置 → 关扭矩 → 0x0B → 读回 → 对上才改目标 → 扭矩复原 → 加锁；扭矩只关几毫秒，关节不会被重力压下去，也不会跳；没对上就原地不动报失败；中途出错也会加锁。原偏移备份在 `calib/`，可撤销（只挪回当次挪过的姿态）
 - 单颗操作：下拉选舵机（带关节名，离线的标出来），导出 0–86 全部寄存器（JSON / Markdown 表，做**寄存器底账**用）、重启 0x08、中位校准、改 ID（旧 ID 只列在线的，新 ID 列 15 个标准位、占用的标出来）、写寄存器（下拉带寄存器名，EEPROM 区自动勾解锁，写完回读核对）
 - 串口原始收发全进日志文件（十六进制 + 寄存器名 + 舵机应答），排查飞特那些「回成功但没执行」的操作靠它
-- 日志分 系统 / 总线 / 运动 / 校准 / 寄存器 / 姿态 / 方向 / 页面 八类，警告、错误标色并计数，可按类筛选、只看警告错误、一键复制。每条同时写进 `logs/servo-web-日期.log`，出错的带 traceback；校准每颗一行：读数前后、偏移前后、每一步的应答。出问题把这个文件发过来就能查
+- 日志分 系统 / 总线 / 运动 / 校准 / 寄存器 / 姿态 / 方向 / IMU / 页面，警告、错误标色并计数，可按类筛选、只看警告错误、一键复制。每条同时写进 `logs/servo-web-日期.log`，出错的带 traceback；校准每颗一行：读数前后、偏移前后、每一步的应答。出问题把这个文件发过来就能查
 - `sync_read` 时序测试：15 颗一次读 200 遍，报 min / avg / p99 / max 和失败数
 - 自检：`python selftest.py`，不接舵机。[`sim_bus.py`](sim_bus.py) 是协议级的 HD-1910 模拟器（按字节收发飞特包，模拟锁、扭矩、0x0B、HD-1910 不认 128、偏移、掉线），让真实的 `feetech.py` + `server.py` 把校准、撤销、改 ID、写寄存器、导出都跑一遍。改了跟舵机打交道的代码先跑它再上真机
 - 后端不依赖飞特 SDK，[`feetech.py`](feetech.py) 直接按 2026 版协议手册发包（[`docs/飞特资料/`](../../docs/飞特资料/)），一百多行
@@ -38,6 +38,47 @@ python server.py --fake                      # 没舵机，只看界面
 python build_model.py --src <microduck_rl>/src/mjlab_microduck/robot/microduck
 ```
 
+## 可选：J-Link 读取 IMU 躯干姿态
+
+调试台可以在**同一个模型**上组合两种读数：舵机关节角继续驱动原有的关节，IMU 四元数驱动躯干姿态。沿用本服务、`/ws`、模型文件和 CDN，不启动第二个网页服务。不给 IMU 参数时隐藏该区域，原有串口功能照常。
+
+适用已验证的 **STM32G031F8P6 + LSM6DSV16X 同款板**；J-Link 模式需要 Windows x64、Python 3.11+、自己安装的 SEGGER J-Link USB 驱动和 `JLink_x64.dll`。裸板固件与烧录步骤见 [`hardware/imu_to_dxl/firmware/`](../../hardware/imu_to_dxl/firmware/)，原理图和接线见[硬件目录](../../hardware/imu_to_dxl/)。J3.1 接 GND、J3.2 接 SWCLK、J3.3 接 SWDIO、**J3.6 接 VTref**；J3.4/5 是串口，不能接成电源参考。
+
+1. 将 `imu-jlink.example.json` 复制为 `imu-jlink.json`，填写自己的 `dll` 和 `probe_serial`。文件已被 Git 忽略。
+2. 让 Keil、J-Link Commander 等退出调试，释放探针；板上应已运行配套 HEX。
+3. 在 `tools/servo-web/` 运行以下命令，浏览器仍打开 `http://127.0.0.1:8080`：
+
+```bash
+python server.py --port COM5 --imu-jlink imu-jlink.json  # 舵机串口 + 真 IMU
+python server.py --fake --imu-jlink imu-jlink.json       # 只有 IMU 裸板，关节为演示值
+python server.py --fake --imu-demo                       # 两者都是演示，不接硬件
+```
+
+JSON 中的路径相对于该配置文件；DLL 可使用 `E:/SEGGER/JLink/JLink_x64.dll` 这类完整路径，但必须改成自己的实际安装位置。`firmware` 可省略，默认使用仓库的 `hardware/imu_to_dxl/firmware/Build/imu_to_dxl.hex`；`hz` 为 1–20；`resume` 默认为 `false`。只在明确需要恢复暂停的 CPU 时设置 `resume: true`，也必须先通过固件校验。序列号没有默认值，不自动选择探针。
+
+首次收到有效姿态时自动设显示零位，也可平放板子后点“归零”。安装方向默认绕 Y +90°（`DEFAULT_MOUNT`），按实物安装方向调整后重新归零。这些操作只影响网页，不写 IMU、舵机或 Flash。归零后的画面显示相对姿态；“原始姿态”也只是相对 IMU 启动参考。
+
+连接、异常、状态变化和显示校准记入同一个 `logs/servo-web-日期.log`，分类为 **IMU**；数据不逐帧写日志。停止服务会释放 J-Link；要回 Keil 调试请先停止本服务，单独关闭浏览器标签不会释放探针。当前没有网页端探针重连或复位操作，连接异常处理完后重启服务。
+
+### 固件校验与验证范围
+
+- 只提交一份 `.hex`，不需要下载 `.bin` 或 `.map`。后端校验 Intel HEX 记录和连续 Flash 镜像，解码后为 **11612 字节**，SHA-256 为 `69bdaea7224900addd6eb5bd28001e26e07073c129383d9c1ece380d2bfce19a`。只有此镜像才使用已审核的 RAM 布局，连接后还会逐字节比对实际 Flash；不同固件拒绝读取姿态或恢复 CPU。
+- 修改固件后先检查新的 MAP 中结构、地址及大小，再更新对应的已验证哈希和布局。不能只取消哈希校验。本工具不执行烧录。
+- 此前 J-Link 9.78、SWD 100 kHz 实板读取约 20 Hz；SDK 建连曾导致板上程序重启，不能视为无扰动观察。当前整合版另做无硬件自检，**尚未验证真舵机与真 IMU 同时运行**，需上机核对轴向与长时间稳定性。
+- **附带固件仍是 Dynamixel Protocol 2.0、ID 200、地址 124 的 12 字节块**，尚未实现飞特地址 56 的 15 字节契约。SWD 画面正常不代表飞特总线、`FeetechIo` 或 `imu200.py check` 验收通过。
+- 六轴 IMU 航向会漂移，网页不测平移、不判断真实脚底接触。重心和支撑区仍是模型几何估计，不能据此判定整机能够稳定站立或行走；断流时保留最后姿态并标记失效。
+
+### 无硬件回归检查
+
+```bash
+pip install -r requirements-test.txt
+python selftest.py
+python -m pytest test_imu_bridge.py test_imu_server.py
+node --test test_imu_attitude.cjs
+```
+
+Node.js 只用于前端数学测试，正常使用调试台不需要。固件主机测试与历史实板记录见 [VALIDATION.md](../../hardware/imu_to_dxl/firmware/VALIDATION.md)。
+
 ## 注意
 
 - **URT-2 先插 USB，再给舵机上电。** 反了总线电平会卡在 2.1 V，扫描一颗都没有、只有广播能收到几个 0，见[踩坑记录](../../踩坑记录.md#工具)。
@@ -55,6 +96,7 @@ python build_model.py --src <microduck_rl>/src/mjlab_microduck/robot/microduck
 
 | 版本 | 日期 | 改了什么 |
 |---|---|---|
+| 0.10.0 | 2026-09-21 | 可选 `--imu-jlink`：同一个 WebSocket、日志和 3D 模型组合舵机关节角与 IMU 躯干姿态；保留安装方向/显示归零，支持无硬件 `--imu-demo`，未启用 IMU 时原界面不变。配套固件与硬件资料放在一起，仓库只保留 HEX |
 | 0.9.1 | 2026-09-20 | 串口原始收发进日志文件：每包发了什么、舵机回了什么，十六进制 + 寄存器名（`→ #32 位置校准 ff ff 20 02 0b f2` / `← #32 状态0x00 …`）。飞特不支持的操作照样回「成功」，只有对着原始字节才分得清「真做了」和「装作做了」。10 Hz 的状态轮询不记，不然日志全是它 |
 | 0.9.0 | 2026-09-20 | 按代码审核重写校准（subagent 审出来的，全是"会把关节拉走"那一类）：判据从「读数等于目标」改成「偏移寄存器变没变」，因为飞特不支持的操作照样回成功；**重力下垂补偿** —— 关扭矩那几毫秒关节会掉（实测颈部 0.62 步/ms，而 USB 串口一个来回 1~16 ms），下垂量由「校准前读数、目标、偏移变化」算出来再补回去，16 ms 慢总线下零位误差从 99 步降到 0；关扭矩后回读确认（这包丢了会导致 0x0B 在扭矩开着时执行，偏移一改就满速拉）；目标位置永远写当前读数、绝不写目标值；出错也在 finally 里写目标、恢复扭矩、加锁；校准期间独占总线并压低加速度和速度；偏移符号方向开机探一次（±1 步）不再每颗试错；寄存器 31/42/46 改用符号-幅值编码（原来负数写成补码会被理解成 -32763 撞限位）；偏移量程收到 ±2047；撤销时校准后新存的姿态也跟着挪回；备份原子写、先落盘再挪姿态。模拟器加了重力下垂和总线延迟，这类 bug 现在测得出来 |
 | 0.8.1 | 2026-09-20 | 串口打不开也把页面起起来（USB 没插、口号变了、被占用都不再崩），退到假总线并在日志里列出现有串口；顶栏加串口下拉和「连接」按钮，插好 USB 点一下就接管，不用重启服务 |
@@ -79,5 +121,8 @@ python build_model.py --src <microduck_rl>/src/mjlab_microduck/robot/microduck
 | `sim_bus.py` / `selftest.py` | 协议级舵机模拟器 / 后端自检 |
 | `logs/` `calib/` | 运行日志、校准前的偏移备份，本机的，不进仓库 |
 | `index.html` | 单文件前端，three.js 从 CDN 来 |
+| `imu_bridge.py` / `test_imu_bridge.py` | J-Link 读取、固件验证、样本解码及无硬件测试 |
+| `imu_attitude.js` / `test_imu_attitude.cjs` | IMU 四元数、安装方向与显示参考转换及回归测试 |
+| `imu-jlink.example.json` / `test_imu_server.py` | 个人配置模板 / 现有服务的 IMU 整合测试 |
 | `build_model.py` | MuJoCo XML + STL → `model/model.json` + `model/meshes.bin`（顶点 int16 量化，21 MB 变 2.9 MB） |
 | `model/` | 生成好的模型，14 个关节 |
