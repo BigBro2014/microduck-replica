@@ -17,6 +17,7 @@ uint32_t board_millis(void);
 uint32_t board_micros(void);
 void board_delay_ms(uint32_t ms);
 void board_watchdog_feed(void);
+void board_reboot(void);
 int board_spi_read(uint8_t reg, uint8_t *data, uint16_t len);
 int board_spi_write(uint8_t reg, const uint8_t *data, uint16_t len);
 int board_bus_pop(uint8_t *byte, uint32_t *received_us);

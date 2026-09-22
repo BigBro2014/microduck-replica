@@ -15,7 +15,7 @@
 #define BOARD_RX_EN_PIN            7u   /* PB7; PB8 shares package pin: ANALOG */
 #define BOARD_SPI_BR               4u   /* PCLK/32: 2 MHz at 64 MHz */
 #define BOARD_SPI_MODE             3u   /* LSM6DSV16X supports mode 0 and 3 */
-#define BOARD_FIRMWARE_STRING      "imu_to_dxl 0.1.0"
+#define BOARD_FIRMWARE_STRING      "imu_to_dxl 0.2.0"
 
 #if BOARD_HSE_HZ != 16000000UL
 #error Update PLL settings before using an oscillator other than 16 MHz

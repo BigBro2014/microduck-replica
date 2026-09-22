@@ -22,8 +22,8 @@ try {
     if ($LASTEXITCODE) { throw 'IMU tests failed' }
     & .\Tests\control_table_test.cmd
     if ($LASTEXITCODE) { throw 'Control table tests failed' }
-    & $PythonExe -B Tests\probe_test.py
-    if ($LASTEXITCODE) { throw 'PC probe tests failed' }
+    & $PythonExe -B Tests\bus_sim_test.py
+    if ($LASTEXITCODE) { throw 'Bus simulation acceptance failed' }
     Write-Host 'All host tests passed. This test run did not connect to hardware.'
 } finally {
     Pop-Location

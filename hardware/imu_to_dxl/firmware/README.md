@@ -1,41 +1,38 @@
-# imu_to_dxl 固件 0.1.0
+# imu_to_dxl 固件 0.2.0
 
 用于队友自制的 **STM32G031F8P6 + LSM6DSV16X** 板。硬件基线为
 `fanhao375/microduck-replica` 的 `a1f4979c425bd9228622be89f2bfa4d1de7fbde3`
 （2026-09-08，含 J4/J5 和 RX_EN）。2026-09-20 已完成首次实板启动：J-Link SWD 连接、
 固件烧录读回校验、Keil 停在 `main`、64MHz 时钟及 IMU 采样均已验证。
 短测中 IMU 标识为 `0x70`、ready=1、SPI/FIFO 错误为0；外部总线和舵机尚未实测。
+
+**0.2.0（2026-09-22）把总线协议换成飞特 SCS/STS**，逐条按[总线协议](../总线协议.md)实现：ID 200、地址 56 的 15 字节块、sync_read 排队。IMU、板级和 Keil 工程未改。电脑上的主机测试和「真协议代码上模拟总线」的验收（`Tests/bus_sim_test.py`，用 [`tools/imu200`](../../../tools/imu200) 的 `check` 判据）全部通过；已烧进原开发板，IMU 照常工作。**真总线和舵机尚未实测。**
 构建、桌面测试与首次实板验证的边界见 [VALIDATION.md](VALIDATION.md)。
 
 本目录与原理图、PCB 放在一起，提供源码、Keil 工程及唯一保留的预编译产物
-[`Build/imu_to_dxl.hex`](Build/imu_to_dxl.hex)。串口调试台的可选 J-Link 观察入口见
-[`tools/servo-web`](../../../tools/servo-web)：在同一个网页中叠加舵机关节角和 IMU 躯干姿态，
-启动时启用 `server.py --imu-jlink`，其余探针参数见调试台说明。
+[`Build/imu_to_dxl.hex`](Build/imu_to_dxl.hex)。串口调试台 [`tools/servo-web`](../../../tools/servo-web)能在同一个网页中叠加舵机关节角和 IMU 躯干姿态，三种读法：`--imu-bus`（舵机总线，跟主控同一条 sync_read）、`--imu-swd`（ST-Link / DAPLink）、`--imu-jlink`（J-Link）。
 
-观察器从 HEX 解码 `0x08000000` 起的 **11,612 字节** Flash 镜像，检查 SHA-256
-`69bdaea7224900addd6eb5bd28001e26e07073c129383d9c1ece380d2bfce19a`，并校验板上镜像。
-只有这个基线可使用已审核的 RAM 布局：`sample=0x20000064`（60 字节）、
-`tick=0x20000BE0`（4 字节）。仅使用姿态网页无需重新编译；改动固件后需重新审核
+SWD / J-Link 观察器从 HEX 解码 `0x08000000` 起的 **10,724 字节** Flash 镜像，检查 SHA-256
+`66bc7c532f5a1ad87e3dfff71a4b51f8c4f20840a8f62436874fa5b7c665938e`，并校验板上镜像。
+只有这个基线可使用已审核的 RAM 布局：`sample=0x2000006C`（60 字节）、
+`tick=0x20000A34`（4 字节），按 0.2.0 的 MAP 核对过。仅使用姿态网页无需重新编译；改动固件后需重新审核
 Flash 校验值及这两个符号的地址、大小，不能沿用旧地址读取新程序。
 
 源码断点调试需在自己的环境重新构建 `.axf`；构建仍生成 `.map`、`.bin` 供开发时复核，
 这些文件及测试产物由 `.gitignore` 排除，不提交到仓库。
 
 数据流：LSM6DSV16X → SPI1 → STM32 → USART2 + 外部缓冲 → 单线半双工总线 → Linux 主控。
-默认实现官方主控所用的 **Dynamixel Protocol 2.0，ID 200，1Mbps**。
+实现**飞特 SCS/STS 协议，ID 200，1Mbps**，在舵机总线上冒充一颗舵机（0.1.0 是 Dynamixel Protocol 2.0）。
 代码不驱动舵机运动，不写 MCU Option Bytes，不写固件配置到 Flash。
 
-**本次发布用于 J-Link 裸板姿态台架验证。** 外部总线尚未实测；现有协议实现及124地址的12字节块
-不代表已经满足最新[总线协议](../总线协议.md)中地址56的15字节飞特协议验收，也不保证与
-[`tools/imu200`](../../../tools/imu200) 直接互通。
-正式主控与飞特舵机联调需要另行完成协议适配、电气检查和硬件验收。
+**真总线验收**：接上半双工适配器（URT-2）跑 `python tools/imu200/imu200.py check --port COMx`，13 项判据照主控源码写，过了才能上整机。电气检查（DE 释放、电平、T_resp 实测）仍需逻辑分析仪。
 
 ## 1. 直接开始
 
 ### Keil
 
 1. 使用 J-Link 时，打开 `MDK-ARM/imu_to_dxl_jlink.uvprojx`。
-2. 在自己的 Keil 中选择已合法安装的 Arm Compiler 6（本工程验证版本为 6.24）和 `STM32G031F8Px` 器件包。
+2. 在自己的 Keil 中选择已合法安装的 Arm Compiler 6（验证过 6.24 和 6.22；MDK 5.24 这类带 6.7 的老版本编不了，CMSIS 6 头文件要求 ≥ 6.10，会报 `cmsis_clang.h` 找不到）和 `STM32G031F8Px` 器件包。
 3. 按 **F7** 编译；`Build/imu_to_dxl.hex` 为烧录文件，`.axf` 用于源码断点调试。
 4. 在 Debug → Settings 中选择自己的 J-Link，核对 SWD、STM32G0xx 64KB Flash 算法和 Run to main。
    `JLinkSettings.JLinkScript` 在连接和复位后将传输速度设为 **100kHz**；保留此文件。
@@ -69,13 +66,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Tools\build.ps1
 | `Core/Inc/board_config.h` | 集中的板级开关、时钟、波特率、SPI 速率 |
 | `Core/Src/board.c` | 时钟、GPIO、SPI、USART、SWD 保留、毫秒/微秒时基、看门狗 |
 | `Core/Src/imu.c` | 身份检查、初始化回读、FIFO、原始加速度/陀螺仪、SFLP、故障重试 |
-| `Core/Src/protocol.c` | DXL2 协议解析、CRC、字节填充、总线顺序应答 |
-| `Core/Src/control_table.c` | 主控数据块、诊断寄存器及有限 RAM 配置 |
+| `Core/Src/protocol.c` | 飞特 SCS/STS 从机：帧解析（按校验和重同步）、各指令应答、sync_read 排队、应答时序 |
+| `Core/Src/control_table.c` | 地址 56 的 15 字节块、状态位、诊断寄存器 |
 | `Core/Src/main.c` | 主循环调度、串口命令及状态日志 |
 | `Drivers/` | 固定版本的 ST/CMSIS 源码与许可证 |
 | `MDK-ARM/` | Keil 工程、链接布局和 J-Link 低速连接脚本 |
-| `Tools/imu_probe.py` | 电脑端只读 Ping/Read/Sync Read、数据解码和 CSV 采集 |
-| `Tests/` | 无板可运行的协议、模拟传感器、寄存器和采集脚本测试 |
+| `Tests/` | 无板可运行的协议、模拟传感器、寄存器测试；`bus_sim_test.py` 把真协议代码编成 DLL 挂到模拟总线上跑验收 |
 
 无动态内存，无 RTOS，无 HAL 依赖。板级代码使用 ST 官方 CMSIS 寄存器定义；传感器使用官方平台无关驱动。
 STM32 的外部总线接收使用中断环形队列，每字节保存接收时刻；协议、采样和日志格式化运行在主循环。
@@ -139,28 +135,32 @@ J1/J2：1=GND、2=VDD_BUS、3=DATA；J4/J5：1=DATA、2=VDD_BUS、3=GND。
 
 ## 5. 通信与寄存器
 
-实现 DXL2 子集：定点 Ping、Read、Write，广播 Sync Read、Sync Write、Bulk Read。
-每帧至多512字节，每次读取至多256字节；损坏 CRC 静默丢弃，支持收发字节填充。
-字节间超时1.5ms，排队等待前序设备最长25ms；超期应答取消，避免在下一事务中抢总线。
-发送前再次原子检查新到达的 RX 数据、USART BUSY 和故障标志；忙时放弃这次应答。
+帧格式 `FF FF ID LEN INSTR 参数… CHK`，`CHK = ~(ID+LEN+INSTR+Σ参数)`，没有字节填充，所以载荷里也会出现 `FF FF`：接收按长度收完再验校验和，校验错就丢一个字节重新找帧头，不会被载荷里的假帧头带偏。逐条行为见[总线协议 §8](../总线协议.md#8-其它指令怎么应答)：
 
-Sync/Bulk Read 按请求列表中的前序设备状态包顺序回复，前序设备缺席则取消。
-**把 ID200 放在 Sync Read 列表第一位**，与官方 `bus.rs` 相同。
-广播 Ping 暂时静默，应直接对 ID200 Ping；通用广播扫描工具可能看不到本板。
-未实现飞特/协议1、协议自动识别、Fast Read、Reg Write、Action、MCU Reboot、恢复出厂或配置持久化。
-飞特舵机路线还需要后续的协议和 Linux 主控适配，当前首版用于 IMU 单板和官方 DXL2 接口调试。
+| 指令 | 行为 |
+|---|---|
+| `SYNC_READ 0x82`（广播） | 自己在列表第 k 位：k=0 收完指令 50 µs 后发；k>0 等前面 k 个设备的应答帧（ID 在前面、长度对、第 5 字节不是指令码），前面有设备 1 ms 不出声就当它不在线跳过 |
+| `PING` / `READ`（单播） | 回状态帧 / 数据，ERROR 恒为 0；广播 PING 不答 |
+| `WRITE` / `REG_WRITE`（单播） | 回 ACK，内容一概忽略（主控从不写这块板） |
+| `ACTION` `0x06` `0x09` `0x0A` `0x0B`（单播） | ACK，不动作 |
+| `REBOOT 0x08` | 不答，真重启 |
+| `SYNC_WRITE`、别的广播 | 不答 |
+
+时序（全是推断值，待实测，见总线协议 §5/§12；50 µs 是协议逻辑里的数，加上解析和组包的 CPU 时间后真实值要逻辑分析仪量）：T_resp 50 µs；帧内字节间隙超过 500 µs 丢弃残帧；排队时总线静默 1 ms 认为前一个设备不在线；等不到轮次 25 ms 放弃；到点后晚 2 ms 还发不出去就放弃，避免在下一笔事务里抢总线。发送前再次原子检查新到达的 RX 数据、USART BUSY 和故障标志；忙时放弃这次应答。
+接收中断里只有**溢出（ORE）**才当总线故障清空收包；噪声 / 帧错标志只计数，字节照收，错了由校验和丢掉 —— 0.1.0 一律清空，一个字节带噪声标志就会把整条 sync_read 扔掉、这一 tick 15 颗舵机跟着丢（0.2.0 审查后改）。
+
+**把 ID200 放在 Sync Read 列表第一位**，与官方 `bus.rs` 相同；放中间也能答（排队规则），但前面的设备缺席时主控侧的解析会错位，见总线协议 §2。
 
 多字节字段全部小端。
 
 | 地址 | 字节数 | 内容 / 权限 |
 |---|---:|---|
-| 0 | 2 | 自定义型号 `0x4D44`，只读，不冒充 ROBOTIS 舵机 |
-| 6 | 1 | 固件协议版本1，只读 |
-| 7 / 8 | 各1 | ID200 / 波特率选择值3（1Mbps），只读 |
-| 9 | 1 | Return Delay，0~254，每单位2us，默认0；RAM可写 |
-| 65 | 1 | RAM测试标记，可读写；板上没有对应 LED |
-| 68 | 1 | 状态返回等级0/1/2，默认2；RAM可写 |
-| 124 | 6 | gyro XYZ，三个 int16，±500dps |
+| 0 / 1 | 各1 | 固件版本 0.2（主.次），不冒充舵机的 3.46 |
+| 2 | 1 | END = 0（小端） |
+| 3 | 2 | 自定义型号 `0x4D44` |
+| 5 / 6 / 8 | 各1 | ID 200 / 波特率 0（1Mbps）/ 应答状态级别 1 |
+| **56** | **15** | **主控每 tick 读的块**：gyro XYZ（int16，17.5 mdps/LSB）、四元数 XYZ（binary16）、采样计数（u8）、状态位、保留 0。原始轴序，不做坐标变换 |
+| 124 | 6 | gyro XYZ，三个 int16，±500dps（诊断，跟块里同一份） |
 | 130 | 6 | quaternion XYZ，三个 IEEE binary16；W由主控重建 |
 | 136 | 6 | 原始加速度 XYZ，三个 int16，±4g |
 | 142 | 1 | 姿态采样计数低8位 |
@@ -170,15 +170,16 @@ Sync/Bulk Read 按请求列表中的前序设备状态包顺序回复，前序�
 | 148 / 152 / 156 | 各4 | 姿态 / gyro / accel 采样计数 |
 | 160 / 164 / 168 | 各4 | uptime_ms / gyro年龄ms / 姿态年龄ms |
 | 172 / 176 / 180 / 184 | 各4 | SPI错误 / FIFO溢出 / 非法四元数 / 恢复次数 |
-| 188 / 192 / 196 / 200 | 各4 | RX队列溢出 / UART错误 / CRC错误 / 非法包 |
+| 188 / 192 / 196 / 200 | 各4 | RX队列溢出 / UART错误（噪声/帧错/溢出都计）/ 校验和错误 / 非法包 |
 | 204 / 208 / 212 / 216 | 各4 | 收包超时 / 有效收包数 / 实际发包数 / 取消应答数 |
 | 220 / 224 / 228 / 232 | 各4 | RCC复位原因原值 / 主频Hz / TX超时 / 日志丢弃数 |
-| 236 | 1 | 本项目诊断寄存器表版本1 |
-| 240 | 1 | 写 `0xA5` 请求重新初始化 IMU；读为0；不会重启 MCU |
+| 236 | 1 | 本项目诊断寄存器表版本 2（飞特协议，块在 56） |
+| 240 | 4 | sync_read 排队时判定前面设备不在线、跳过的次数 |
 | 244 | 4 | 发送前检测到总线忙而放弃应答的次数 |
 
-其余0~255地址读为0、写拒绝。只有124~135的12字节是对齐已检查上游的接口；
-136及之后是**本项目自定义诊断扩展**，不宣称与上游旧20字节注释或舵机电压/温度寄存器兼容。
+其余 0~255 地址读为 0；写一律 ACK 但不生效（重新初始化 IMU 改用 J3 日志串口的 `r` 命令）。56~70 是主控接口；124 及之后是**本项目自定义诊断扩展**，不宣称与舵机的电压/温度寄存器兼容。
+
+块里的状态位（byte 13）：BIT0 融合没就绪（四元数全 0）；BIT1 跟 IMU 通信失败（SPI/复位超时/配置/数据过期/FIFO）；BIT2 自检失败（WHO_AM_I 不对）；BIT3 两次读块之间刷新了 4 次以上（120 Hz 采样、50 Hz 读每次正常 2~3 次）。
 错误码见 `imu.h`：0正常、1启动、2SPI、3身份、4复位超时、5配置、6过期、7FIFO、8四元数。
 时钟状态：0=HSI PLL、1=HSE PLL、2=HSE失败回退HSI PLL、3=PLL失败HSI16、4=切换失败回退。
 
@@ -189,24 +190,21 @@ Sync/Bulk Read 按请求列表中的前序设备状态包顺序回复，前序�
 3. 接 J3 日志串口，115200/8N1。应有版本信息；每秒输出 ready、id、错误和数据。
    `s`打印状态，`l`切换周期日志，`r`重新初始化IMU，`?`查看帮助。
 4. 检查 WHO_AM_I=0x70、ready=1、采样计数增长，翻面/转动三轴核对加速度及姿态方向。
-5. 只接IMU的总线，运行下方只读脚本，确认 Ping、Read 和 Sync Read。
+5. 只接 IMU 的总线（URT-2 等半双工适配器），运行 `python tools/imu200/imu200.py check --port COMx --only-imu`（只问 200），再接舵机跑完整的 `check`。
 6. 用逻辑分析仪检查1Mbps、DE极性、最后停止位后释放、RX恢复及最坏回复延迟。
 7. 接入一个舵机，再接完整总线；ID200放第一。记录错误、丢包、FIFO及采样年龄。
 8. 完成主控失效处理和安装方向核对后，再进行支撑状态下的整机联调。
 
-### 电脑采集工具
+### 电脑验收工具
 
-该工具需要 Python 3.10+ 和 pyserial。可在本项目内建立虚拟环境：
+总线验收用 [`tools/imu200/imu200.py`](../../../tools/imu200/imu200.py)（0.1.0 的 `Tools/imu_probe.py` 说的是 Dynamixel 协议，已随协议更换删除）。需要 Python 3.10+ 和 pyserial：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --no-cache-dir -r Tools\requirements.txt
-.\.venv\Scripts\python.exe Tools\imu_probe.py --port COM5 --seconds 30 --csv Build\imu.csv
-.\.venv\Scripts\python.exe Tools\imu_probe.py --port COM5 --seconds 30 --sync
+python tools/imu200/imu200.py check --port COM5   # 13 项逐条 PASS/FAIL，判据照主控源码
+python tools/imu200/imu200.py demo                # 不接硬件，看假小板怎么答
 ```
 
-把 COM5 替换为**半双工总线适配器**端口；J3日志口不能响应这些协议指令。
-脚本只发送读指令，不会给舵机发送运动指令。退出码非0表示出现通信错误或采样未就绪。
+把 COM5 替换为**半双工总线适配器**端口；J3日志口不能响应这些协议指令。日志落在 `tools/imu200/logs/`（原始收发十六进制 + 每帧一行 JSONL）。
 需要安装可运行的 Python，Windows 应用商店入口占位符不能运行这些脚本；编译固件本身无需 Python。
 
 ## 7. 验证与已知限制
@@ -227,7 +225,8 @@ FIFO实际更新率、SFLP初始收敛和坐标方向、温漂、看门狗恢复
 - [STM32G031数据手册](https://www.st.com/resource/en/datasheet/stm32g031f8.pdf)
 - [LSM6DSV16X数据手册](https://www.st.com/resource/en/datasheet/lsm6dsv16x.pdf)
 - [ST IMU驱动](https://github.com/STMicroelectronics/lsm6dsv16x-pid)
-- [ROBOTIS Protocol 2.0](https://emanual.robotis.com/docs/en/dxl/protocol2/)
+- 飞特《SCS 通信协议》与内存表：仓库 [`docs/飞特资料/`](../../../docs/飞特资料/)
+- [本板总线协议（接口契约）](../总线协议.md)
 - [所检查的上游主控接口](https://github.com/pollen-robotics/microduck/blob/5984efb770855432b03dafd3d879e9929981e45b/duck-control/src/bus.rs)
 
 本项目新写代码按 MIT 许可提供；第三方文件保留各自版权和许可，见各 Drivers 目录。

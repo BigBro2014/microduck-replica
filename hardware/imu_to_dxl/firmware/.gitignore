@@ -14,3 +14,5 @@ __pycache__/
 *.uvguix.*
 JLinkLog.txt
 JLinkSettings.ini
+MDK-ARM/DebugConfig/
+MDK-ARM/build.log

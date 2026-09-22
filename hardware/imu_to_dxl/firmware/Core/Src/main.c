@@ -31,9 +31,9 @@ int main(void)
     uint32_t last_log = 0u;
     uint8_t periodic_log = 1u;
     board_init();
-    proto_init(&protocol, control_table_read, control_table_write, send_packet, &protocol);
+    proto_init(&protocol, control_table_read, send_packet, &protocol);
     imu_init(board_millis());
-    board_log("\r\n" BOARD_FIRMWARE_STRING " | STM32G031F8 | DXL2 ID=200 1000000 8N1\r\n");
+    board_log("\r\n" BOARD_FIRMWARE_STRING " | STM32G031F8 | Feetech ID=200 1000000 8N1 block@56\r\n");
     board_log("LOG=115200 8N1; ?:help s:status l:toggle logs r:restart IMU\r\n");
     for (;;) {
         uint8_t byte;
@@ -43,6 +43,9 @@ int main(void)
             proto_feed(&protocol, byte, received_us);
         }
         proto_poll(&protocol, board_micros());
+        if (protocol.reboot_requested) {
+            board_reboot();               /* REBOOT 0x08: no reply, back within 800 ms (sec.8). */
+        }
         /* Do not begin sensor/log work while an instruction is being received
          * or a synchronized reply is queued. Protocol traffic has priority. */
         if (protocol.rx_length == 0u && protocol.pending == 0u) {

@@ -10,6 +10,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import locale
 import os
 from pathlib import Path
 import shutil
@@ -38,8 +39,10 @@ def main() -> int:
         setup = build / "capture-msvc-env.cmd"
         setup.write_text('@echo off\ncall "' + str(vcvars) + '" >nul\n'
                          'if errorlevel 1 exit /b 1\nset\n', encoding="utf-8")
+        # vcvars 的 set 输出是本地代码页（中文系统是 GBK），按它解码，别让 stdout 变成 None
         result = subprocess.run([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c",
-                                 str(setup)], env=env, capture_output=True, text=True)
+                                 str(setup)], env=env, capture_output=True, text=True,
+                                encoding=locale.getpreferredencoding(False), errors="replace")
         if result.returncode:
             print(result.stdout + result.stderr, file=sys.stderr)
             return result.returncode

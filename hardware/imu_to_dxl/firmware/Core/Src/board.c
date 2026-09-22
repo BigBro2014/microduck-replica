@@ -147,6 +147,7 @@ void board_init(void)
 
 void SysTick_Handler(void) { ++tick_ms; }
 uint32_t board_millis(void) { return tick_ms; }
+void board_reboot(void) { NVIC_SystemReset(); }
 uint32_t board_micros(void) { return TIM2->CNT; }
 void board_delay_ms(uint32_t ms)
 { uint32_t start = tick_ms; while ((uint32_t)(tick_ms - start) < ms) { __NOP(); } }
@@ -197,7 +198,12 @@ void USART2_IRQHandler(void)
     uint32_t status = USART2->ISR;
     if (status & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE | USART_ISR_PE)) {
         USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF | USART_ICR_PECF;
-        ++board_diagnostics.uart_errors; bus_fault = 1u;
+        ++board_diagnostics.uart_errors;
+        /* Only an overrun loses bytes: drop the partial frame. A noise / framing
+         * flag keeps its byte in RDR; the frame checksum rejects it if it is
+         * wrong. Treating those as faults would also flush the good bytes of
+         * the same tick and silence the board for a whole Sync Read. */
+        if (status & USART_ISR_ORE) bus_fault = 1u;
     }
     if (status & USART_ISR_RXNE_RXFNE) {
         uint8_t byte = (uint8_t)USART2->RDR;
