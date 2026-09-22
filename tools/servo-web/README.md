@@ -38,7 +38,7 @@ python server.py --fake                      # 没舵机，只看界面
 python build_model.py --src <microduck_rl>/src/mjlab_microduck/robot/microduck
 ```
 
-## 可选：J-Link 读取 IMU 躯干姿态
+## 可选：IMU 躯干姿态（舵机总线 / ST-Link / DAPLink / J-Link）
 
 调试台可以在**同一个模型**上组合两种读数：舵机关节角继续驱动原有的关节，IMU 四元数驱动躯干姿态。沿用本服务、`/ws`、模型文件和 CDN，不启动第二个网页服务。不给 IMU 参数时隐藏该区域，原有串口功能照常。
 
@@ -58,14 +58,46 @@ JSON 中的路径相对于该配置文件；DLL 可使用 `E:/SEGGER/JLink/JLink
 
 首次收到有效姿态时自动设显示零位，也可平放板子后点“归零”。安装方向默认绕 Y +90°（`DEFAULT_MOUNT`），按实物安装方向调整后重新归零。这些操作只影响网页，不写 IMU、舵机或 Flash。归零后的画面显示相对姿态；“原始姿态”也只是相对 IMU 启动参考。
 
-连接、异常、状态变化和显示校准记入同一个 `logs/servo-web-日期.log`，分类为 **IMU**；数据不逐帧写日志。停止服务会释放 J-Link；要回 Keil 调试请先停止本服务，单独关闭浏览器标签不会释放探针。当前没有网页端探针重连或复位操作，连接异常处理完后重启服务。
+### 最省事：`--imu-bus`，直接从舵机总线读
+
+小板挂在舵机总线上（固件 0.2.0 起是飞特协议），**不用任何调试器**，URT-2 一根线舵机和 IMU 一起读：
+
+```bash
+python server.py --port COM5 --imu-bus      # 真总线：15 颗舵机 + ID 200
+python server.py --fake --imu-bus           # 没硬件：假总线上挂一块假小板，看效果
+```
+
+- 发的是跟主控每 tick **同一条** sync_read：地址 56、长度 15、**ID 200 排第一**，后面跟舵机。舵机状态照旧解，200 的块按主控的判据解（全 0 四元数 = 融合没出数；norm² > 1.02 拒绝；12 字节连续 25 帧不变 = frozen；保留字节必须是 0；状态位 BIT1/BIT2 是板子自己报的故障），跟 `tools/imu200` 同一套。
+- 规格里写了：板子不应答时，同一条 sync_read 里后面的舵机数据会跟着丢。所以 200 **连续 5 帧不应答就出列**，舵机单独读，每 2 秒单独 PING 一次 200，应答了再放回来 —— 没接小板时调试台照样能用，日志 IMU 分类里写明卡在哪。
+- 只有网页连着的时候才轮询（跟舵机状态同一个循环）；校准期间停。台架上只接小板、扫描没扫到舵机也照样读 200。
+- 调试台自己按 10 Hz 读，两次读之间块刷新了约 12 次，所以固件的 BIT3（「读得太慢」，给 50 Hz 的主控看的）每帧都会亮；这是调试台读得慢，不提示。原始状态位照样在帧里（`status_bits`）。
+- 固件是 0.1.0（Dynamixel 协议）的板子不会应答，先按 [`firmware/`](../../hardware/imu_to_dxl/firmware/) 烧 0.2.0。
+
+### 没有 J-Link：`--imu-swd`（ST-Link / DAPLink，经 pyOCD）
+
+读法跟上面一样：先查目标电压，再逐字节比对板上 Flash，然后读同一块 RAM 快照，不烧写、不写内存。区别是走 [pyOCD](https://pyocd.io/)，**ST-Link、CMSIS-DAP（DAPLink）都能用**，不用配置文件。**J-Link 请用上面的 `--imu-jlink`**：经 pyOCD 连 J-Link 会默认从 19 脚供 5 V、可能静默升级探针固件，绕开了那条路的保护，所以 `--imu-swd` 会直接拒绝 J-Link。
+
+```bash
+pip install pyocd
+python server.py --fake --imu-swd                           # 只插一个调试器：自动选
+python server.py --fake --imu-swd 301612179216303030303032  # 插了多个：用 UID 指定（pyocd list 查）
+python server.py --port COM5 --imu-swd                      # 舵机串口 + 真 IMU
+```
+
+- 接线同上：J3.1 GND、J3.2 SWCLK、J3.3 SWDIO、J3.6 接调试器的 **VTref / TVCC**（只测电压，不供电）。板子自己从总线口供电；调试器若有 3.3 V 输出脚（有的 ST-LINK/V2 是 19 脚），**别跟总线电源同时接**。
+- ST-LINK/V2 的 20 针有不同版本：有的 4/6/8/10 脚是 GND，有的是 UART、BOOT0、SWIM。**GND 只用 12/18/20 脚**。
+- 用 `attach` 模式连接：不复位、不暂停，断开时也不发 Go；不加载当前目录的 `pyocd.yaml` / 用户脚本。它仍会写调试寄存器（DHCSR.C_DEBUGEN 等），断开后 C_DEBUGEN 保持置位，所以不能算对目标零影响。实测（2026-09-22，ST-LINK/V2 V2J43S7，100 kHz）：连续连接 3 次，芯片计时跟墙钟对得上，**不会让板子重启**；刷新约 20 Hz，数据年龄 6–11 ms。
+- 连芯片之前先查目标电压：只有 ST-Link 测得出来，不在 3.0–3.5 V 就拒绝（接近 0 V 会提示 VTref/TVCC 没接或板子没上电）；DAPLink 读不到电压，网页显示「—」，不拦。出错会分清是「调试器打不开」（被 Keil/CubeProgrammer 占用、ST-Link 固件太旧）还是「连不上芯片」（接线、供电）。
+- 要回 Keil 或 CubeProgrammer，先停本服务，释放调试器。
+
+连接、异常、状态变化和显示校准记入同一个 `logs/servo-web-日期.log`，分类为 **IMU**；数据不逐帧写日志。停止服务会释放调试器（J-Link / ST-Link / DAPLink）；要回 Keil 调试请先停止本服务，单独关闭浏览器标签不会释放探针。当前没有网页端探针重连或复位操作，连接异常处理完后重启服务。
 
 ### 固件校验与验证范围
 
-- 只提交一份 `.hex`，不需要下载 `.bin` 或 `.map`。后端校验 Intel HEX 记录和连续 Flash 镜像，解码后为 **11612 字节**，SHA-256 为 `69bdaea7224900addd6eb5bd28001e26e07073c129383d9c1ece380d2bfce19a`。只有此镜像才使用已审核的 RAM 布局，连接后还会逐字节比对实际 Flash；不同固件拒绝读取姿态或恢复 CPU。
+- 只提交一份 `.hex`，不需要下载 `.bin` 或 `.map`。SWD / J-Link 后端校验 Intel HEX 记录和连续 Flash 镜像，解码后为 **10724 字节**（固件 0.2.0），SHA-256 为 `66bc7c532f5a1ad87e3dfff71a4b51f8c4f20840a8f62436874fa5b7c665938e`，RAM 布局 `sample=0x2000006C`、`tick=0x20000A34`。只有此镜像才使用已审核的 RAM 布局，连接后还会逐字节比对实际 Flash；不同固件拒绝读取姿态或恢复 CPU。
 - 修改固件后先检查新的 MAP 中结构、地址及大小，再更新对应的已验证哈希和布局。不能只取消哈希校验。本工具不执行烧录。
 - 此前 J-Link 9.78、SWD 100 kHz 实板读取约 20 Hz；SDK 建连曾导致板上程序重启，不能视为无扰动观察。当前整合版另做无硬件自检，**尚未验证真舵机与真 IMU 同时运行**，需上机核对轴向与长时间稳定性。
-- **附带固件仍是 Dynamixel Protocol 2.0、ID 200、地址 124 的 12 字节块**，尚未实现飞特地址 56 的 15 字节契约。SWD 画面正常不代表飞特总线、`FeetechIo` 或 `imu200.py check` 验收通过。
+- **附带固件 0.2.0 已是飞特协议**（ID 200、地址 56 的 15 字节块），真协议代码在模拟总线上通过了 `imu200.py check`；但**真总线还没测**，SWD 画面正常也不代表真总线、`FeetechIo` 验收通过。上整机前跑 `imu200.py check --port`。
 - 六轴 IMU 航向会漂移，网页不测平移、不判断真实脚底接触。重心和支撑区仍是模型几何估计，不能据此判定整机能够稳定站立或行走；断流时保留最后姿态并标记失效。
 
 ### 无硬件回归检查
@@ -73,7 +105,7 @@ JSON 中的路径相对于该配置文件；DLL 可使用 `E:/SEGGER/JLink/JLink
 ```bash
 pip install -r requirements-test.txt
 python selftest.py
-python -m pytest test_imu_bridge.py test_imu_server.py
+python -m pytest test_imu_bridge.py test_imu_server.py test_imu_swd.py test_imu_bus.py
 node --test test_imu_attitude.cjs
 ```
 
@@ -96,6 +128,8 @@ Node.js 只用于前端数学测试，正常使用调试台不需要。固件主
 
 | 版本 | 日期 | 改了什么 |
 |---|---|---|
+| 0.12.0 | 2026-09-22 | 可选 `--imu-bus`：直接从舵机总线读 IMU 小板，跟主控同一条 sync_read（地址 56、长度 15、200 排第一），按主控判据解块（未就绪、拒绝、frozen、保留字节、板子故障位）；200 连续 5 帧不应答就出列、每 2 秒单独 PING，没接小板时舵机照样读；`--fake --imu-bus` 有假小板可看效果。配套固件 0.2.0（飞特协议），SWD/J-Link 观察器的 HEX 哈希和 RAM 地址跟着更新 |
+| 0.11.0 | 2026-09-22 | 可选 `--imu-swd`：经 pyOCD 用 ST-Link / DAPLink 读 IMU 姿态，不用 J-Link DLL 和配置文件（J-Link 仍走 `--imu-jlink`，`--imu-swd` 会拒绝它）。跟 J-Link 路径同一套保护：连芯片前先查电压、比对板上 Flash、只读 RAM、CPU 暂停不自动恢复；attach 模式连接，实测不会让板子重启。只插一个调试器时自动选，多个时要写 UID。ST-Link 顺带显示目标电压；pyOCD 的警告也记进 IMU 日志。网页标签显示实际调试器名 |
 | 0.10.0 | 2026-09-21 | 可选 `--imu-jlink`：同一个 WebSocket、日志和 3D 模型组合舵机关节角与 IMU 躯干姿态；保留安装方向/显示归零，支持无硬件 `--imu-demo`，未启用 IMU 时原界面不变。配套固件与硬件资料放在一起，仓库只保留 HEX |
 | 0.9.1 | 2026-09-20 | 串口原始收发进日志文件：每包发了什么、舵机回了什么，十六进制 + 寄存器名（`→ #32 位置校准 ff ff 20 02 0b f2` / `← #32 状态0x00 …`）。飞特不支持的操作照样回「成功」，只有对着原始字节才分得清「真做了」和「装作做了」。10 Hz 的状态轮询不记，不然日志全是它 |
 | 0.9.0 | 2026-09-20 | 按代码审核重写校准（subagent 审出来的，全是"会把关节拉走"那一类）：判据从「读数等于目标」改成「偏移寄存器变没变」，因为飞特不支持的操作照样回成功；**重力下垂补偿** —— 关扭矩那几毫秒关节会掉（实测颈部 0.62 步/ms，而 USB 串口一个来回 1~16 ms），下垂量由「校准前读数、目标、偏移变化」算出来再补回去，16 ms 慢总线下零位误差从 99 步降到 0；关扭矩后回读确认（这包丢了会导致 0x0B 在扭矩开着时执行，偏移一改就满速拉）；目标位置永远写当前读数、绝不写目标值；出错也在 finally 里写目标、恢复扭矩、加锁；校准期间独占总线并压低加速度和速度；偏移符号方向开机探一次（±1 步）不再每颗试错；寄存器 31/42/46 改用符号-幅值编码（原来负数写成补码会被理解成 -32763 撞限位）；偏移量程收到 ±2047；撤销时校准后新存的姿态也跟着挪回；备份原子写、先落盘再挪姿态。模拟器加了重力下垂和总线延迟，这类 bug 现在测得出来 |
@@ -121,7 +155,9 @@ Node.js 只用于前端数学测试，正常使用调试台不需要。固件主
 | `sim_bus.py` / `selftest.py` | 协议级舵机模拟器 / 后端自检 |
 | `logs/` `calib/` | 运行日志、校准前的偏移备份，本机的，不进仓库 |
 | `index.html` | 单文件前端，three.js 从 CDN 来 |
-| `imu_bridge.py` / `test_imu_bridge.py` | J-Link 读取、固件验证、样本解码及无硬件测试 |
+| `imu_bridge.py` / `test_imu_bridge.py` | J-Link / pyOCD 读取、固件验证、样本解码及无硬件测试 |
+| `test_imu_swd.py` | `--imu-swd`（pyOCD）读取器测试：用假 pyocd 模块，不接探针 |
+| `imu_bus.py` / `test_imu_bus.py` | `--imu-bus`：从舵机总线解 ID 200 的块、出列/重试、假小板；测试走真 `feetech.py` + `sim_bus` + `imu200.SimImu200` |
 | `imu_attitude.js` / `test_imu_attitude.cjs` | IMU 四元数、安装方向与显示参考转换及回归测试 |
 | `imu-jlink.example.json` / `test_imu_server.py` | 个人配置模板 / 现有服务的 IMU 整合测试 |
 | `build_model.py` | MuJoCo XML + STL → `model/model.json` + `model/meshes.bin`（顶点 int16 量化，21 MB 变 2.9 MB） |

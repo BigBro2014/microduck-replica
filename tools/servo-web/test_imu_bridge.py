@@ -106,7 +106,8 @@ class FirmwareGuardTests(unittest.TestCase):
         self.binary = self.root / "test.bin"
         self.map = self.root / "test.map"
         self.binary.write_bytes(b"test-image")
-        self.map.write_text(" sample 0x20000064 Data 60 imu.o(.bss.data)\n tick_ms 0x20000be0 Data 4 board.o(.bss.tick_ms)\n")
+        self.map.write_text(f" sample 0x{bridge.SAMPLE_ADDRESS:08x} Data 60 imu.o(.bss.data)\n"
+                            f" tick_ms 0x{bridge.TICK_ADDRESS:08x} Data 4 board.o(.bss.tick_ms)\n")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -120,8 +121,10 @@ class FirmwareGuardTests(unittest.TestCase):
         original = self.map.read_text()
         with patch.object(bridge, "VALIDATED_SHA256", digest):
             good = bridge.validate_firmware_layout(self.binary, self.map)
-            self.assertEqual(good.sample_address, 0x20000064)
-            for bad in (original.replace("Data 60", "Data 64"), original.replace("0x20000064", "0x20000068"),
+            self.assertEqual(good.sample_address, bridge.SAMPLE_ADDRESS)
+            moved = f"0x{bridge.SAMPLE_ADDRESS + 4:08x}"
+            for bad in (original.replace("Data 60", "Data 64"),
+                        original.replace(f"0x{bridge.SAMPLE_ADDRESS:08x}", moved),
                         original.replace("imu.o", "other.o"), original + original, "no symbols"):
                 self.map.write_text(bad)
                 with self.subTest(map=bad), self.assertRaises(bridge.BridgeError):
@@ -130,9 +133,9 @@ class FirmwareGuardTests(unittest.TestCase):
     def test_current_firmware_validates_without_loading_dll(self):
         layout = bridge.validate_firmware_layout(bridge.DEFAULT_FIRMWARE, bridge.DEFAULT_MAP)
         self.assertEqual(layout.sha256, bridge.VALIDATED_SHA256)
-        self.assertEqual(layout.tick_address, 0x20000BE0)
-        self.assertEqual(layout.sample_address, 0x20000064)
-        self.assertEqual(len(layout.image), 11612)
+        self.assertEqual(layout.tick_address, 0x20000A34)
+        self.assertEqual(layout.sample_address, 0x2000006C)
+        self.assertEqual(len(layout.image), 10724)
 
     @staticmethod
     def record(kind, data=b"", address=0):
@@ -149,7 +152,7 @@ class FirmwareGuardTests(unittest.TestCase):
         with patch.object(bridge, "VALIDATED_SHA256", hashlib.sha256(b"test-image").hexdigest()):
             layout = bridge.validate_firmware_layout(hex_file)
             self.assertEqual(layout.image, b"test-image")
-            self.assertEqual(layout.sample_address, 0x20000064)
+            self.assertEqual(layout.sample_address, bridge.SAMPLE_ADDRESS)
 
     def test_corrupt_or_ambiguous_hex_records_rejected(self):
         extended = self.record(4, b"\x08\x00")

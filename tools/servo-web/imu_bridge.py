@@ -7,6 +7,11 @@ device-specific SDK connection/debug initialization may still alter state.
 Validate behavior against the actual DLL/target logs. The config's resume flag opts
 in to Go() only after firmware verification if the CPU is halted. All DLL calls
 belong to one worker thread.
+
+SwdReader is the same observation through pyOCD, for ST-Link or CMSIS-DAP
+(DAPLink) probes: check target voltage, attach without reset/halt, verify the
+board Flash against the HEX, then read the same RAM snapshot. J-Link probes are
+refused there (use JLinkReader), see the SwdReader docstring.
 """
 from __future__ import annotations
 
@@ -27,14 +32,17 @@ LOGGER = logging.getLogger("imu_bridge")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FIRMWARE = PROJECT_ROOT / "hardware/imu_to_dxl/firmware/Build/imu_to_dxl.hex"
 DEFAULT_MAP = None  # Optional locally generated map, never required by the checkout.
-VALIDATED_SHA256 = "69bdaea7224900addd6eb5bd28001e26e07073c129383d9c1ece380d2bfce19a"
-# These symbols were reviewed against the map for the exact image above.
+VALIDATED_SHA256 = "66bc7c532f5a1ad87e3dfff71a4b51f8c4f20840a8f62436874fa5b7c665938e"
+# These symbols were reviewed against the map for the exact image above:
+# firmware 0.2.0 (Feetech protocol), Keil MDK 5.41 / Arm Compiler 6.22, 10724 bytes.
+# (0.1.0, Dynamixel 2.0: 69bdaea7..., sample 0x20000064, tick 0x20000BE0.)
 # A different build must be reviewed before adding a new digest/layout pair.
-SAMPLE_ADDRESS = 0x20000064
-TICK_ADDRESS = 0x20000BE0
+SAMPLE_ADDRESS = 0x2000006C
+TICK_ADDRESS = 0x20000A34
 SNAPSHOT_SIZE = 60
 SENSOR_STALE_MS = 100
 HOST_STALE_MS = 350
+SWD_FREQUENCY_HZ = 100_000  # 与 J-Link 路径相同：首板 4 MHz 下载出过传输失败
 
 
 class BridgeError(RuntimeError):
@@ -359,19 +367,7 @@ class JLinkReader:
             raise BridgeError("目标 CPU 已暂停；未自动恢复，姿态显示已停止。")
         # No explicit halt per frame. Equal bracketing counters improve detection
         # of torn reads, but are not a seqlock: telemetry explicitly says so.
-        address = self.layout.sample_address
-        for attempt in range(2):
-            before = struct.unpack("<I", self.read(address + 24, 4))[0]
-            raw = self.read(address, SNAPSHOT_SIZE)
-            tick = struct.unpack("<I", self.read(self.layout.tick_address, 4))[0]
-            after = struct.unpack("<I", self.read(address + 24, 4))[0]
-            inner = struct.unpack_from("<I", raw, 24)[0]
-            coherence = "counter_stable" if before == inner == after else "best_effort"
-            frame = decode_snapshot(raw, tick, voltage_mv=self.voltage_mv, coherence=coherence)
-            frame["read_attempts"] = attempt + 1
-            if frame["coherence"] != "inconsistent":
-                break
-        return frame
+        return bracketed_snapshot(self.read, self.layout, self.voltage_mv)
 
     def close(self) -> None:
         if self.opened:
@@ -382,14 +378,207 @@ class JLinkReader:
             self.dll_directory = None
 
 
+def bracketed_snapshot(read, layout: FirmwareLayout, voltage_mv: int | None) -> dict[str, Any]:
+    """与 JLinkReader.snapshot 同一套读法：快照前后各读一次采样计数，相等才算没撕裂。"""
+    address = layout.sample_address
+    for attempt in range(2):
+        before = struct.unpack("<I", read(address + 24, 4))[0]
+        raw = read(address, SNAPSHOT_SIZE)
+        tick = struct.unpack("<I", read(layout.tick_address, 4))[0]
+        after = struct.unpack("<I", read(address + 24, 4))[0]
+        inner = struct.unpack_from("<I", raw, 24)[0]
+        coherence = "counter_stable" if before == inner == after else "best_effort"
+        frame = decode_snapshot(raw, tick, voltage_mv=voltage_mv, coherence=coherence)
+        frame["read_attempts"] = attempt + 1
+        if frame["coherence"] != "inconsistent":
+            break
+    return frame
+
+
+class SwdReader:
+    """pyOCD 观察：ST-Link / CMSIS-DAP(DAPLink)。J-Link 不走这里，用 --imu-jlink。
+
+    不烧写、不写 RAM、不复位、不暂停：connect_mode=attach，resume_on_disconnect=False
+    （断开时不隐式 Go），no_config=True（不加载当前目录的 pyocd.yaml / 用户脚本）。
+    target_override=cortex_m：按通用 Cortex-M 连，只读内存，不需要芯片包和 Flash 算法。
+    跟 JLinkReader 一样先逐字节比对板上 Flash 与 HEX，不一致就不读 RAM。
+
+    这不等于对目标零影响：attach 仍会写调试寄存器（DHCSR.C_DEBUGEN、DEMCR.TRCENA、
+    FPB/DWT 使能），断开后 C_DEBUGEN 保持置位 —— 这期间固件里的 BKPT 会停住 CPU 而不是进 HardFault。
+    实测（ST-LINK/V2，100 kHz）连续连接不会让板子重启。
+
+    J-Link 经 pyOCD 会默认从 19 脚供 5 V（jlink.power）、可能静默升级探针固件、
+    关闭时不保证不 Go，绕开了 JLinkReader 的保护，所以这里直接拒绝。
+    """
+
+    def __init__(self, layout: FirmwareLayout, probe_id: str | None = None, resume: bool = False) -> None:
+        self.layout, self.probe_id, self.resume = layout, probe_id, resume
+        self.session: Any = None
+        self.target: Any = None
+        self.halted_state: Any = None
+        self.voltage_mv: int | None = None
+        self.probe_name: str | None = None
+        self.probe_uid: str | None = None
+
+    @staticmethod
+    def options() -> dict[str, Any]:
+        return {"target_override": "cortex_m", "connect_mode": "attach", "frequency": SWD_FREQUENCY_HZ,
+                "resume_on_disconnect": False, "auto_unlock": False, "no_config": True}
+
+    def choose_probe(self, probes: list[Any]) -> Any:
+        def is_jlink(p: Any) -> bool:
+            return type(p).__name__ == "JLinkProbe"
+        found = "；".join(f"{p.description} {p.unique_id}" for p in probes)
+        jlink_hint = "J-Link 请改用 --imu-jlink（走 SEGGER 官方 DLL，带不供电、不升级固件、不隐式恢复运行的保护）。"
+        if not probes:
+            raise BridgeError("没找到调试器（ST-Link / DAPLink）；检查 USB 和驱动，"
+                              "并关掉 Keil 调试、CubeProgrammer 等占用调试器的程序。")
+        if self.probe_id is None or self.probe_id == "auto":
+            usable = [p for p in probes if not is_jlink(p)]
+            if not usable:
+                raise BridgeError("只找到 J-Link。" + jlink_hint)
+            if len(usable) > 1:
+                raise BridgeError(f"插了 {len(usable)} 个调试器，用 --imu-swd <UID> 指定一个：{found}")
+            return usable[0]
+        matches = [p for p in probes if p.unique_id == self.probe_id]
+        if not matches:
+            raise BridgeError(f"没找到 UID 为 {self.probe_id} 的调试器；现在插着的：{found}")
+        if is_jlink(matches[0]):
+            raise BridgeError("指定的是 J-Link。" + jlink_hint)
+        return matches[0]
+
+    def connect(self) -> None:
+        try:
+            from pyocd.core.helpers import ConnectHelper
+            from pyocd.core.session import Session
+            from pyocd.core.target import Target
+        except ImportError as exc:
+            raise BridgeError("SWD 模式需要 pyOCD：pip install pyocd") from exc
+        self.halted_state = Target.State.HALTED
+        chosen = self.choose_probe(list(ConnectHelper.get_all_connected_probes(blocking=False)))
+        self.probe_name, self.probe_uid = chosen.description, chosen.unique_id
+        LOGGER.info("SWD 探针：%s %s（%s）", self.probe_name, self.probe_uid, type(chosen).__name__)
+
+        # 第 1 步：只打开调试器、不碰芯片，先看目标电压（JLinkReader 也是连芯片前查电压）。
+        probe_only = Session(chosen, options=self.options())
+        try:
+            probe_only.open(init_board=False)
+        except Exception as exc:
+            self.close_session(probe_only)
+            raise BridgeError(f"打开调试器失败（{type(exc).__name__}: {exc}）：可能被 Keil 调试、"
+                              "CubeProgrammer 占用，或 ST-Link 固件太旧（用 CubeProgrammer 升级）。") from exc
+        try:
+            self.check_voltage(probe_only.probe)
+        finally:
+            self.close_session(probe_only)
+
+        # 第 2 步：attach 到芯片。
+        self.session = Session(chosen, options=self.options())
+        try:
+            self.session.open()
+        except Exception as exc:
+            raise BridgeError(f"SWD 连接芯片失败（{type(exc).__name__}: {exc}）："
+                              "检查 SWDIO、SWCLK、GND、VTref 接线和板子供电。") from exc
+        self.target = self.session.target
+        # 第 3 步：只读板上 Flash 做比对，从不烧写。
+        actual = self.read(0x08000000, len(self.layout.image))
+        if actual != self.layout.image:
+            raise BridgeError("板上固件与已验证文件不一致，拒绝继续读取 RAM 或恢复执行。")
+        if self.is_halted():
+            if not self.resume:
+                raise BridgeError("目标 CPU 已暂停。固件已验证；如需恢复运行，退出 Keil 调试后重新上电。")
+            try:
+                self.target.resume()
+            except Exception as exc:
+                raise BridgeError(f"恢复运行失败（{type(exc).__name__}: {exc}）。") from exc
+            if self.is_halted():
+                raise BridgeError("恢复运行失败；检查 Keil 残留断点。")
+
+    def check_voltage(self, probe: Any) -> int | None:
+        # pyOCD 里只有 ST-Link 能测目标电压（私有接口 _link）。没有这个接口（DAPLink）就不显示、不拦；
+        # 有接口但读失败或读不到，按连接异常处理，不悄悄放过。
+        link = getattr(probe, "_link", None)
+        getter = getattr(link, "get_target_voltage", None)
+        if getter is None:
+            self.voltage_mv = None
+            return None
+        try:
+            getter()
+            volts = link.target_voltage
+        except Exception as exc:
+            raise BridgeError(f"读目标电压失败（{type(exc).__name__}: {exc}），调试器可能已断开。") from exc
+        if not isinstance(volts, (int, float)) or not math.isfinite(volts):
+            raise BridgeError("读不到目标电压：检查 J3.6 是否接到调试器的 VTref/TVCC。")
+        self.voltage_mv = int(round(volts * 1000))
+        if self.voltage_mv < 500:
+            raise BridgeError(f"目标电压只有 {self.voltage_mv} mV：J3.6 没接到 VTref/TVCC，或者板子没上电。")
+        if not 3000 <= self.voltage_mv <= 3500:
+            raise BridgeError(f"目标参考电压为 {self.voltage_mv} mV，不在已验证的 3.3 V 范围内。")
+        return self.voltage_mv
+
+    def read_voltage(self) -> int | None:
+        return self.check_voltage(getattr(self.session, "probe", None))
+
+    def is_halted(self) -> bool:
+        try:
+            return self.target.get_state() == self.halted_state
+        except Exception as exc:
+            raise BridgeError(f"读 CPU 运行状态失败（{type(exc).__name__}: {exc}）："
+                              "板子可能掉电了，或 SWD 线松了。") from exc
+
+    def read(self, address: int, size: int) -> bytes:
+        if address < 0 or size <= 0 or address + size > 0x100000000:
+            raise BridgeError("读取地址或长度超出有效范围。")
+        try:
+            # 对齐时按 32 位字读，免得正在更新的计数被拆成 4 次字节读拼出来。
+            if address % 4 == 0 and size % 4 == 0:
+                words = self.target.read_memory_block32(address, size // 4)
+                data = struct.pack(f"<{len(words)}I", *words)
+            else:
+                data = bytes(self.target.read_memory_block8(address, size))
+        except Exception as exc:
+            raise BridgeError(f"读取失败 0x{address:08X}（{type(exc).__name__}: {exc}）。"
+                              "请检查接线并重新启动连接。") from exc
+        if len(data) != size:
+            raise BridgeError(f"读取失败 0x{address:08X}：{len(data)}/{size} 字节。")
+        return data
+
+    def snapshot(self) -> dict[str, Any]:
+        if self.is_halted():
+            raise BridgeError("目标 CPU 已暂停；未自动恢复，姿态显示已停止。")
+        return bracketed_snapshot(self.read, self.layout, self.voltage_mv)
+
+    @staticmethod
+    def close_session(session: Any) -> None:
+        try:
+            session.close()
+        except Exception as exc:
+            LOGGER.warning("关闭调试器连接出错：%s: %s", type(exc).__name__, exc)
+        # 打开到一半失败时 session.close() 可能认为探针没开，USB 却已被占住，这里再兜底关一次。
+        probe = getattr(session, "probe", None)
+        if probe is not None and getattr(probe, "is_open", False):
+            try:
+                probe.close()
+            except Exception as exc:
+                LOGGER.warning("关闭调试器 USB 出错：%s: %s", type(exc).__name__, exc)
+
+    def close(self) -> None:
+        session, self.session, self.target = self.session, None, None
+        if session is not None:
+            self.close_session(session)
+
+
 class BridgeService:
     def __init__(self, *, demo: bool = False, resume: bool = False,
                  firmware: Path = DEFAULT_FIRMWARE, map_file: Path | None = DEFAULT_MAP,
                  dll_path: Path | None = None, serial: int | None = None,
-                 hz: float = 20.0, connect_attempts: int = 3) -> None:
-        if not demo:
+                 hz: float = 20.0, connect_attempts: int = 3,
+                 backend: str = "jlink", probe_id: str | None = None) -> None:
+        if backend not in ("jlink", "swd"):
+            raise BridgeError(f"未知探针后端：{backend}")
+        if not demo and backend == "jlink":
             dll_path, serial = validate_probe_settings(dll_path, serial)
-        self.demo, self.resume = demo, resume
+        self.demo, self.resume, self.backend, self.probe_id = demo, resume, backend, probe_id
         self.firmware, self.map_file, self.dll_path = firmware, map_file, dll_path
         self.serial, self.hz, self.connect_attempts = serial, max(1.0, min(hz, 20.0)), connect_attempts
         self.lock = threading.Lock()
@@ -397,10 +586,12 @@ class BridgeService:
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.last_publish = time.monotonic()
-        self.frame = empty_frame("demo" if demo else "live", "disconnected", "正在启动演示。" if demo else "正在连接 J-Link 并校验固件。")
+        connecting = "正在连接 J-Link 并校验固件。" if backend == "jlink" else "正在连接调试器（pyOCD）并校验固件。"
+        self.frame = empty_frame("demo" if demo else "live", "disconnected", "正在启动演示。" if demo else connecting)
 
     def publish(self, frame: dict[str, Any]) -> None:
         frame["timestamp_ms"] = int(time.time() * 1000)
+        frame.setdefault("backend", self.backend)  # 连接中的帧也带上，网页标签不会先显示成 J-Link
         with self.lock:
             self.frame = frame
             self.last_publish = time.monotonic()
@@ -464,11 +655,12 @@ class BridgeService:
         if self.demo:
             self._run_demo()
             return
-        reader: JLinkReader | None = None
+        reader: JLinkReader | SwdReader | None = None
         try:
             layout = validate_firmware_layout(self.firmware, self.map_file)
             for attempt in range(self.connect_attempts):
-                reader = JLinkReader(layout, self.dll_path, self.serial, self.resume)
+                reader = (SwdReader(layout, self.probe_id, self.resume) if self.backend == "swd"
+                          else JLinkReader(layout, self.dll_path, self.serial, self.resume))
                 try:
                     reader.connect()
                     break
@@ -496,7 +688,11 @@ class BridgeService:
                     smooth_hz = instant if smooth_hz == 0 else smooth_hz * 0.8 + instant * 0.2
                 previous = now
                 frame.update(hz=round(smooth_hz, 1), firmware_sha256=layout.sha256,
-                             sample_address=f"0x{layout.sample_address:08X}", probe_serial=self.serial)
+                             sample_address=f"0x{layout.sample_address:08X}", backend=self.backend)
+                if isinstance(reader, SwdReader):
+                    frame.update(probe_name=reader.probe_name, probe_uid=reader.probe_uid)
+                else:
+                    frame.update(probe_serial=self.serial)
                 self.publish(frame)
                 self.stop_event.wait(max(0.0, 1 / self.hz - (time.monotonic() - started)))
         except Exception as exc:

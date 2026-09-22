@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 调试台版本。改了前端或后端就加一：index.html 里的 PAGE_VERSION 要跟这里一样，
 # 页面连上后会比对，不一样就提示"页面是旧的，Ctrl+F5"。改动记在 README 的「版本」一节。
-VERSION = "0.10.0"
+VERSION = "0.12.0"
 DEFAULT_IDS = "20-24,30-34,10-14"
 JOINT_NAMES = {
     20: "left_hip_yaw", 21: "left_hip_roll", 22: "left_hip_pitch", 23: "left_knee", 24: "left_ankle",
@@ -67,6 +67,7 @@ class FakeBus:
         self.locked = {i: 1 for i in ids}   # 出厂锁着
         self.regs = {}                      # 其它寄存器随便写随便读，(id, 地址) -> 值
         self.stats = {"tx": 0, "rx_ok": 0, "timeout": 0, "bad_checksum": 0, "bad_id": 0}
+        self.imu200 = None                  # --imu-bus 时挂一个 imu_bus.FakeImu200，答 ID 200
 
     def ping(self, sid):
         return 0 if sid in self.pos else None
@@ -126,7 +127,10 @@ class FakeBus:
                 self.torque[sid] = data[0]
 
     def sync_read(self, ids, addr, n):
-        return {i: (0, bytes(n)) if i in self.pos else None for i in ids}
+        out = {i: (0, bytes(n)) if i in self.pos else None for i in ids}
+        if self.imu200 is not None and 200 in out and addr == 56 and n == 15:
+            out[200] = (0, self.imu200.block())
+        return out
 
     def dump(self, sid):
         raw = [0] * feetech.DUMP_END
@@ -167,7 +171,7 @@ BAUD = 1_000_000
 IDS = []
 PRESENT = []
 CLIENTS = set()
-IMU_SERVICE = None  # 可选 J-Link 读取器；与舵机状态共用 /ws，不接受网页控制探针
+IMU_SERVICE = None  # 可选 IMU 读取器（J-Link DLL 或 pyOCD）；与舵机状态共用 /ws，不接受网页控制探针
 LOG = []           # [{"n": 序号, "t": "时:分:秒", "cat": 分类, "level": info/warn/error, "msg": 正文}]
 LOG_N = 0
 LOG_DIR = os.path.join(HERE, "logs")
@@ -1031,6 +1035,37 @@ async def broadcast(text):
             CLIENTS.discard(ws)
 
 
+def read_states_with_imu(ids, service):
+    """--imu-bus：跟主控每 tick 同一条 sync_read（地址 56、长度 15、200 排第一），
+    舵机状态照旧解，200 的块喂给 service。200 连续不应答时 service 会让它暂时出列。"""
+    import imu_bus
+    servo_ids = [i for i in ids if i != imu_bus.IMU_ID]
+    with_imu = service.include_in_sync()
+    if not with_imu and service.due_probe():
+        if service.probe_result(BUS.ping(imu_bus.IMU_ID) is not None):
+            log("ID 200 的 PING 有应答了，重新跟舵机一起读", "IMU")
+    if isinstance(BUS, FakeBus):
+        if BUS.imu200 is None:
+            BUS.imu200 = imu_bus.FakeImu200()
+        st = BUS.states(servo_ids)
+        got = BUS.sync_read([imu_bus.IMU_ID], imu_bus.BLOCK_ADDR, imu_bus.BLOCK_LEN) if with_imu else {}
+    else:
+        ids_sent = ([imu_bus.IMU_ID] if with_imu else []) + servo_ids
+        # 台架上只接小板、200 又暂时出列时列表是空的：不发空 ID 表的 sync_read
+        got = BUS.sync_read(ids_sent, imu_bus.BLOCK_ADDR, imu_bus.BLOCK_LEN) if ids_sent else {}
+        st = {sid: (feetech.FeetechBus._decode_state(*got[sid]) if got.get(sid) else None) for sid in servo_ids}
+    v = got.get(imu_bus.IMU_ID)
+    if with_imu or v is not None:
+        service.feed(v[1] if v else None)
+    return st
+
+
+def stream_should_poll():
+    """这一拍要不要读总线。--imu-bus 时没扫到舵机也要读：台架上可能只接了小板（ID 200 不在扫描范围里）。"""
+    return bool(CLIENTS) and (bool(PRESENT) or imu_backend(IMU_SERVICE) == "bus") \
+        and not CALIB_LOCK.locked()
+
+
 async def stream():
     """按 STREAM_HZ 广播全部舵机状态和新日志。读不到的舵机攒 3 秒报一次，同一个错误 5 秒内只记一次。"""
     sent_n = LOG_N
@@ -1038,11 +1073,14 @@ async def stream():
     err_last, err_t = "", 0.0
     while True:
         t0 = time.monotonic()
-        if CLIENTS and PRESENT and not CALIB_LOCK.locked():
+        if stream_should_poll():
             # 校准期间不抢总线：一次 sync_read 遇上掉包能占几百毫秒，
             # 正好卡在关扭矩的窗口里，关节就垂下去了
             try:
-                st = await asyncio.to_thread(BUS.states, PRESENT)
+                if imu_backend(IMU_SERVICE) == "bus":
+                    st = await asyncio.to_thread(read_states_with_imu, PRESENT, IMU_SERVICE)
+                else:
+                    st = await asyncio.to_thread(BUS.states, PRESENT)
                 for i, v in st.items():
                     if v is None:
                         miss[i] = miss.get(i, 0) + 1
@@ -1112,10 +1150,16 @@ class ImuLogHandler(logging.Handler):
         log(self.format(record), "IMU", level)
 
 
-def imu_error_frame(message):
+def imu_backend(service):
+    """服务用的探针后端名（jlink / swd），拿不到就是 None；只认字符串，免得把怪对象塞进 JSON。"""
+    backend = getattr(service, "backend", None)
+    return backend if isinstance(backend, str) else None
+
+
+def imu_error_frame(message, backend=None):
     return {"type": "imu", "status": "error", "mode": "live", "live": False,
             "connected": False, "quaternion_xyzw": None, "message": message,
-            "timestamp_ms": int(time.time() * 1000)}
+            "backend": backend, "timestamp_ms": int(time.time() * 1000)}
 
 
 async def imu_stream(service, startup_error=None):
@@ -1124,7 +1168,8 @@ async def imu_stream(service, startup_error=None):
     error_last, error_time = "", 0.0
     while True:
         try:
-            frame = imu_error_frame(startup_error) if startup_error else service.get_status()
+            frame = (imu_error_frame(startup_error, imu_backend(service))
+                     if startup_error else service.get_status())
             state = (frame.get("mode"), frame.get("status"), frame.get("connected"))
             if state != previous:
                 level = "error" if frame.get("status") == "error" else (
@@ -1140,7 +1185,7 @@ async def imu_stream(service, startup_error=None):
                 log(message, "IMU", "error", exc=True)
                 error_last, error_time = message, now
             if CLIENTS:
-                await broadcast(json.dumps(imu_error_frame(message)))
+                await broadcast(json.dumps(imu_error_frame(message, imu_backend(service))))
         await asyncio.sleep(0.05)
 
 
@@ -1151,16 +1196,28 @@ async def lifespan(app):
     handler = None
     logger = logging.getLogger("imu_bridge")
     old_level, old_propagate = logger.level, logger.propagate
+    # pyOCD 自己的日志很啰嗦，只收警告以上，跟桥接器同一条 IMU 时间线
+    pyocd_logger = logging.getLogger("pyocd")
+    pyocd_old = (pyocd_logger.level, pyocd_logger.propagate)
+    pyocd_handler = None
     try:
         if service is not None:
             handler = ImuLogHandler()
             logger.addHandler(handler)
             logger.setLevel(logging.INFO)
             logger.propagate = False
+            if imu_backend(service) == "swd":
+                pyocd_handler = ImuLogHandler(level=logging.WARNING)
+                pyocd_logger.addHandler(pyocd_handler)
+                pyocd_logger.setLevel(logging.WARNING)
+                pyocd_logger.propagate = False
             startup_error = None
             try:
                 service.start()
-                log("姿态读取已启动（演示数据）" if service.demo else "J-Link 姿态读取已启动", "IMU")
+                log("姿态读取已启动（演示数据）" if service.demo else
+                    "SWD 姿态读取已启动（pyOCD）" if imu_backend(service) == "swd" else
+                    "总线 IMU 已启用：ID 200 跟舵机在同一条 sync_read 里读（有网页连着才轮询）"
+                    if imu_backend(service) == "bus" else "J-Link 姿态读取已启动", "IMU")
             except Exception as exc:
                 startup_error = f"启动 IMU 失败：{type(exc).__name__}: {exc}"
                 log(startup_error, "IMU", "error", exc=True)
@@ -1180,6 +1237,10 @@ async def lifespan(app):
                 logger.removeHandler(handler)
                 logger.setLevel(old_level)
                 logger.propagate = old_propagate
+                if pyocd_handler is not None:
+                    pyocd_logger.removeHandler(pyocd_handler)
+                    pyocd_logger.setLevel(pyocd_old[0])
+                    pyocd_logger.propagate = pyocd_old[1]
 
 
 app = Starlette(routes=[
@@ -1204,17 +1265,35 @@ def parse_args(argv=None):
     imu = ap.add_mutually_exclusive_group()
     imu.add_argument("--imu-jlink", type=Path, metavar="CONFIG.json",
                      help="用本机配置文件启用 J-Link IMU 读数，数据仍走当前 /ws")
+    imu.add_argument("--imu-swd", nargs="?", const="auto", metavar="UID",
+                     help="用 pyOCD 经 ST-Link / DAPLink 读 IMU（只插一个调试器时可省略 UID；J-Link 用 --imu-jlink）")
+    imu.add_argument("--imu-bus", action="store_true",
+                     help="从舵机总线读 IMU 小板 ID 200（跟主控同一条 sync_read，200 排第一；固件要是飞特协议版）")
     imu.add_argument("--imu-demo", action="store_true", help="合成 IMU 数据，不连接 J-Link")
     return ap.parse_args(argv)
 
 
 def create_imu_service(args):
-    # 不启用时不导入桥接器，也不需要 J-Link SDK。
-    if not args.imu_jlink and not args.imu_demo:
+    # 不启用时不导入桥接器，也不需要 J-Link SDK / pyOCD。
+    imu_swd = getattr(args, "imu_swd", None)
+    imu_bus = getattr(args, "imu_bus", False)
+    if not args.imu_jlink and not args.imu_demo and imu_swd is None and not imu_bus:
         return None
+    if imu_bus:
+        from imu_bus import BusImuService
+        return BusImuService(poll_hz=STREAM_HZ)
     from imu_bridge import BridgeService, DEFAULT_FIRMWARE, validate_probe_settings
     if args.imu_demo:
         return BridgeService(demo=True)
+    if imu_swd is not None:
+        if not imu_swd.strip():
+            raise ValueError("--imu-swd 后面的 UID 不能为空；只插一个调试器时直接写 --imu-swd")
+        import importlib.util
+        if importlib.util.find_spec("pyocd") is None:
+            raise ValueError("--imu-swd 需要 pyOCD：pip install pyocd")
+        if not DEFAULT_FIRMWARE.is_file():
+            raise ValueError(f"IMU 固件文件不存在：{DEFAULT_FIRMWARE}")
+        return BridgeService(backend="swd", probe_id=imu_swd.strip())
     path = args.imu_jlink.resolve()
     try:
         config = json.loads(path.read_text(encoding="utf-8-sig"))
