@@ -226,7 +226,7 @@
 
 <script>
 // 跟 server.py 的 VERSION 一起改。连上后比对，不一致说明浏览器拿的是旧页面
-const PAGE_VERSION = "0.15.0";
+const PAGE_VERSION = "0.15.1";
 const $ = id => document.getElementById(id);
 const v = id => Number($(id).value);
 let ws, names = {}, present = [], ids = [], lastDump = null, sendTimer = {}, lastSent = {};
@@ -458,7 +458,7 @@ function calibRefText() {
   if (!f) return { ref: null, text: '零位（腿伸直、脚板垂直、头平视、嘴闭上）' };
   if (f === '@official:FOLD')
     return { ref: f, text: '官方折叠（头颈摆正）：髋 pitch ±90°（直角尺把大腿摆到跟躯干垂直）、膝 ±90°（折到踝刚好贴上大腿舵机，别再往里顶）、'
-      + '髋 yaw / roll 0°（腿不外撇、不外张）、踝 0°（脚板跟小腿对齐）、脖子竖直、头平视朝正前不歪、嘴闭上' };
+      + '髋 yaw / roll 0°（腿不外撇、不外张）、踝 0°（脚板跟小腿成直角，跟伸直站着时一样）、脖子竖直、头平视朝正前不歪、嘴闭上' };
   const p = posesCache.find(q => q.file === f);
   return p ? { ref: f, text: `姿态「${p.name}」（${f}）的样子` } : { ref: null, text: null };
 }

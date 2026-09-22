@@ -20,6 +20,8 @@
 - 串口原始收发全进日志文件（十六进制 + 寄存器名 + 舵机应答），排查飞特那些「回成功但没执行」的操作靠它
 - 日志分 系统 / 总线 / 运动 / 校准 / 寄存器 / 姿态 / 方向 / IMU / 页面，警告、错误标色并计数，可按类筛选、只看警告错误、一键复制。每条同时写进 `logs/servo-web-日期.log`，出错的带 traceback；校准每颗一行：读数前后、偏移前后、每一步的应答。出问题把这个文件发过来就能查
 - `sync_read` 时序测试：15 颗一次读 200 遍，报 min / avg / p99 / max 和失败数
+- 舵机体检（命令行，**只读**）：`python servo_report.py --port COM5`，读出每颗的保护开关（卸载条件 19）、状态位、温度、电压、电流、偏移、角度限位，按《调试记录》第 5 步判红黄，存成 `logs/体检-时间.md` 和同名 `.json`（0–86 原值）。只接一颗用 `--ids 21`，不知道 ID 用 `--scan-all`。串口不能同时被调试台或 FD 占着
+- 远程排查：[`远程排查交接.md`](远程排查交接.md) 是写给另一台电脑上的 Claude Code 的流程（体检 → 单颗排查 → 开保护 → 折叠校准），在那边说「先读 tools/servo-web/远程排查交接.md，按里面的流程带我做」
 - 自检：`python selftest.py`，不接舵机。[`sim_bus.py`](sim_bus.py) 是协议级的 HD-1910 模拟器（按字节收发飞特包，模拟锁、扭矩、0x0B、HD-1910 不认 128、偏移、掉线），让真实的 `feetech.py` + `server.py` 把校准、撤销、改 ID、写寄存器、导出都跑一遍。改了跟舵机打交道的代码先跑它再上真机
 - 后端不依赖飞特 SDK，[`feetech.py`](feetech.py) 直接按 2026 版协议手册发包（[`docs/飞特资料/`](../../docs/飞特资料/)），一百多行
 
@@ -119,7 +121,7 @@ python server.py --port COM5 --imu-swd                      # 舵机串口 + 真
 ```bash
 pip install -r requirements-test.txt
 python selftest.py
-python -m pytest test_imu_bridge.py test_imu_server.py test_imu_swd.py test_imu_bus.py test_sim.py
+python -m pytest test_imu_bridge.py test_imu_server.py test_imu_swd.py test_imu_bus.py test_sim.py test_servo_report.py
 node --test test_imu_attitude.cjs
 ```
 
@@ -142,6 +144,7 @@ Node.js 只用于前端数学测试，正常使用调试台不需要。固件主
 
 | 版本 | 日期 | 改了什么 |
 |---|---|---|
+| 0.15.1 | 2026-09-22 | 舵机体检 `servo_report.py`（只读，协议模拟器上验证过一个写指令都不发）；`远程排查交接.md`；校准确认框里踝的说法改成「脚板跟小腿成直角」（原来的「对齐」容易理解反） |
 | 0.15.0 | 2026-09-22 | 按审查修（subagent 审的）：开扭矩前先把目标对准当前位置（扭矩关着校完、用手展开再开扭矩会甩回折叠）；校准收尾不再用回读的 67 重写目标 42；模拟里校准 / 撤销不碰 `calib/`、`poses/`；假总线的偏移按符号-幅值编码；接上真串口时拔掉模拟的虚拟 IMU，接 / 拔广播给所有页面。校准确认框逐颗列「现在 → 写成、差几度」，差 30° 以上再确认一次、不拦；3D 可叠加「校准用折叠」；零点没校准前别按「折叠」的提醒 |
 | 0.14.0 | 2026-09-22 | 模拟模式：虚拟舵机按速度 / 加速度寄存器走梯形曲线（原来只有扭矩开着才一阶跟随），扭矩默认开，30 Hz 推状态；「模拟」一栏能随时接 / 拔虚拟 IMU 小板。3D 改成有变化才画（40 多万三角面一直按 60 帧画，点按钮半天才弹确认框）。一键校准加基准「官方折叠」：目标按官方 FOLD 角度 × ± 算，校完零点是官方 2048，存的姿态跟着换算；腿按官方折叠、头颈摆正，15 颗一起标 |
 | 0.13.0 | 2026-09-22 | 「官方姿势」一栏：零位 / 站 / 坐 / 折叠四个按钮（官方 keyframe 按 ± 换算，折叠的膝少折 2° 不顶零件）；3D 叠加半透明的官方姿势，逐关节列「实际 − 官方」的角度差，用来看零点偏了多少 |
@@ -170,6 +173,8 @@ Node.js 只用于前端数学测试，正常使用调试台不需要。固件主
 | `server.py` | HTTP + WebSocket 服务，starlette + uvicorn |
 | `feetech.py` | 飞特协议：PING / READ / WRITE / SYNC_READ / SYNC_WRITE / REBOOT，寄存器名表 |
 | `sim_bus.py` / `selftest.py` | 协议级舵机模拟器 / 后端自检 |
+| `servo_report.py` / `test_servo_report.py` | 舵机体检（只读）/ 对着 `sim_bus` 的测试 |
+| `远程排查交接.md` | 给另一台电脑上的 AI 的排查、校准流程 |
 | `logs/` `calib/` | 运行日志、校准前的偏移备份，本机的，不进仓库 |
 | `index.html` | 单文件前端，three.js 从 CDN 来 |
 | `imu_bridge.py` / `test_imu_bridge.py` | J-Link / pyOCD 读取、固件验证、样本解码及无硬件测试 |
