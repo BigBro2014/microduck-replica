@@ -11,16 +11,17 @@
 | 文件 | 说明 |
 |---|---|
 | [`imu_to_dxl-原理图.pdf`](imu_to_dxl-原理图.pdf) | 矢量 PDF，放大看细节 |
-| [**`firmware/`**](firmware/) | STM32G031 + LSM6DSV16X 裸板调试固件、Keil 工程、主机测试及一个预编译 HEX；目前为 DXL2 基线，尚未实现下行的飞特协议契约 |
+| [**`imu_to_dxl-交互式BOM.html`**](imu_to_dxl-交互式BOM.html) | **焊接用**：嘉立创 EDA 导出的交互式 BOM，下载后浏览器直接打开（离线可用）。点料号，板图上高亮对应位号，焊一种勾一种。GitHub 页面上直接点只显示源码 |
+| [**`firmware/`**](firmware/) | STM32G031 + LSM6DSV16X 固件、Keil 工程、主机测试及一个预编译 HEX；0.2.0 起是飞特 SCS/STS 协议（ID 200），真总线尚未实测 |
 | [**`总线协议.md`**](总线协议.md) | **给写固件的人**：15 字节块逐字节定义、时序要求、排队规则、主控的判据、测试向量、验收方法 |
 | [`imu_to_dxl-接线表.md`](imu_to_dxl-接线表.md) | 逐网络列出每个引脚，可以直接对着核 |
 | [`imu_to_dxl.eprj2`](imu_to_dxl.eprj2) | 嘉立创 EDA 专业版工程，可直接打开改 |
 | [`../../BOM.md`](../../BOM.md) | 完整 BOM，含立创编号与每颗器件的选型理由 |
 
 **固件与姿态查看入口：** [`firmware/README.md`](firmware/README.md) 记录单板启动、IMU采样和验证范围。
-通过 [`tools/servo-web`](../../tools/servo-web) 的可选 `--imu-jlink`，可将裸板姿态叠加到现有舵机调试台的3D鸭子；
-关节角来自舵机，躯干四元数来自J-Link读取的IMU。当前固件使用 DXL2、ID200、地址124的12字节块，
-尚未实现地址56的15字节飞特契约；飞特总线直接读取和 `imu200.py check` 验收属于下一步。
+通过 [`tools/servo-web`](../../tools/servo-web) 可将小板姿态叠加到舵机调试台的 3D 鸭子：关节角来自舵机，躯干四元数来自 IMU。
+三种读法：`--imu-bus`（舵机总线，跟主控同一条 sync_read，读 ID 200 地址 56 的 15 字节块）、`--imu-swd`（ST-Link / DAPLink）、`--imu-jlink`（J-Link）。
+真总线的 `imu200.py check` 验收还没做。
 
 ---
 
